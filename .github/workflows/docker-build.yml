@@ -28,11 +28,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      # Enable QEMU for cross-platform emulation (required for ARM builds on x86 runners)
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
-
-      # Enable Docker Buildx (required for multi-platform builds)
+      # Enable Docker Buildx (still needed for cache, provenance/SBOM, etc.)
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -58,13 +54,13 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=sha,prefix=sha-
 
-      # Build and push multi-architecture Docker image
-      - name: Build and push multi-arch image
+      # Build and push amd64-only Docker image
+      - name: Build and push image
         uses: docker/build-push-action@v7
         with:
           context: .
           push: ${{ github.event_name != 'pull_request' }}
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
