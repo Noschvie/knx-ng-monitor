@@ -38,11 +38,13 @@ public class DiagnosticsController : ControllerBase
 
     private readonly LogBuffer _logBuffer;
     private readonly IMonitorHeartbeatRepository _heartbeats;
+    private readonly IRecordingSettingsProvider _recording;
 
-    public DiagnosticsController(LogBuffer logBuffer, IMonitorHeartbeatRepository heartbeats)
+    public DiagnosticsController(LogBuffer logBuffer, IMonitorHeartbeatRepository heartbeats, IRecordingSettingsProvider recording)
     {
         _logBuffer = logBuffer;
         _heartbeats = heartbeats;
+        _recording = recording;
     }
 
     /// <summary>Recent log entries from the in-memory buffer, optionally filtered.</summary>
@@ -176,8 +178,12 @@ public class DiagnosticsController : ControllerBase
         var previous = await _heartbeats.GetLastBeforeAsync(from, ct);
         // Where the record begins: everything before it is unknown rather than an outage.
         var recordStart = await _heartbeats.GetEarliestTimestampAsync(ct);
+        // With buffered writes the newest beats are still in memory, so the tail may lag by the
+        // write interval without being an outage.
+        var writeInterval = TimeSpan.FromSeconds(Math.Max(0, _recording.HistoryWriteIntervalSeconds));
         return AvailabilityCalculator.Build(
-            beats, from, to, MonitorHeartbeatWorker.Interval, previous, recordStart);
+            beats, from, to, MonitorHeartbeatWorker.Interval, previous, recordStart,
+            trailingTolerance: writeInterval + 2 * MonitorHeartbeatWorker.Interval);
     }
 
     private static (DateTime From, DateTime To) ResolveAvailabilityRange(DateTime? from, DateTime? to, int defaultDays)

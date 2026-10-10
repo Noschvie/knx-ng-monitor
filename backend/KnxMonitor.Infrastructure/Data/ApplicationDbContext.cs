@@ -25,6 +25,7 @@ public class ApplicationDbContext : DbContext
     public DbSet<KnxConfiguration> KnxConfigurations => Set<KnxConfiguration>();
     public DbSet<RecordingSettings> RecordingSettings => Set<RecordingSettings>();
     public DbSet<MonitorHeartbeat> MonitorHeartbeats => Set<MonitorHeartbeat>();
+    public DbSet<ChartSelection> ChartSelections => Set<ChartSelection>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -208,7 +209,10 @@ public class ApplicationDbContext : DbContext
             // so deleting a project's GAs (SetNull on telegrams) is index-backed — the real
             // delete cost was EF's tracked cascade, which ProjectRepository.DeleteProjectFastAsync
             // now bypasses with set-based ExecuteUpdate/ExecuteDelete.
-            entity.HasIndex(e => new { e.Timestamp, e.DestinationAddress });
+            // SourceAddress rides along as the last column: the top-senders statistic (#38) is then
+            // covered too. A second (Timestamp, SourceAddress) index made SQLite pick it for the
+            // destination queries as well, which then had to read every row of the range.
+            entity.HasIndex(e => new { e.Timestamp, e.DestinationAddress, e.SourceAddress });
 
             entity.HasOne(e => e.GroupAddress)
                 .WithMany(g => g.Telegrams)
@@ -220,7 +224,8 @@ public class ApplicationDbContext : DbContext
         modelBuilder.Entity<KnxConfiguration>(entity =>
         {
             entity.HasKey(e => e.Id);
-            entity.Property(e => e.IpAddress).IsRequired().HasMaxLength(50);
+            // 253 = longest DNS name; a tunneling gateway may be addressed by host name (#23).
+            entity.Property(e => e.IpAddress).IsRequired().HasMaxLength(253);
             entity.Property(e => e.Port).IsRequired();
             entity.Property(e => e.ConnectionType)
                 .IsRequired()
@@ -229,6 +234,13 @@ public class ApplicationDbContext : DbContext
             entity.Property(e => e.IsActive).IsRequired();
             entity.Property(e => e.AutoConnect).IsRequired().HasDefaultValue(true);
             entity.Property(e => e.UseSecureTunnel).IsRequired().HasDefaultValue(false);
+            entity.Property(e => e.TunnelProtocol)
+                .IsRequired()
+                .HasConversion<string>()
+                .HasMaxLength(10)
+                .HasDefaultValue(TunnelProtocol.Udp);
+            entity.Property(e => e.TunnelAddress).HasMaxLength(20);
+            entity.Property(e => e.TunnelAddressFallback).IsRequired().HasDefaultValue(true);
             entity.Property(e => e.CreatedAt).IsRequired();
             entity.Property(e => e.UpdatedAt).IsRequired();
         });
@@ -240,6 +252,7 @@ public class ApplicationDbContext : DbContext
             entity.Property(e => e.HotBufferMaxCount).IsRequired();
             entity.Property(e => e.ArchiveEnabled).IsRequired();
             entity.Property(e => e.ArchiveRetentionDays);
+            entity.Property(e => e.HistoryWriteIntervalSeconds).IsRequired().HasDefaultValue(0);
             entity.Property(e => e.UpdatedAt).IsRequired();
         });
 
@@ -252,6 +265,18 @@ public class ApplicationDbContext : DbContext
             entity.Property(e => e.TelegramsSinceLast).IsRequired();
             // Every read is a range scan over time, and retention deletes by the same key.
             entity.HasIndex(e => e.Timestamp);
+        });
+
+        // ChartSelection entity configuration (saved group-address sets of the charts view)
+        modelBuilder.Entity<ChartSelection>(entity =>
+        {
+            entity.HasKey(e => e.Id);
+            // NOCASE so "Pumpe" and "pumpe" are the same selection, not two near-duplicates.
+            entity.Property(e => e.Name).IsRequired().HasMaxLength(100).UseCollation("NOCASE");
+            entity.HasIndex(e => e.Name).IsUnique();
+            entity.Property(e => e.Addresses).IsRequired().HasMaxLength(400);
+            entity.Property(e => e.CreatedAt).IsRequired();
+            entity.Property(e => e.UpdatedAt).IsRequired();
         });
     }
 }

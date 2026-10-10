@@ -15,8 +15,13 @@ public partial class TelegramsController
     private const int MaxMaxPoints = 10000;
     // Hard cap on rows pulled per series request so a wide range stays bounded.
     private const int SeriesRowCap = 200_000;
+    // Earlier telegrams looked at per address when searching the carry-in value: the newest one
+    // may carry no number (a read request), so a few are needed, but not the whole history.
+    private const int CarryLookback = 20;
     private const int DefaultStatsBuckets = 60;
     private const int MaxStatsBuckets = 500;
+    private const int DefaultTopLimit = 20;
+    private const int MaxTopLimit = 100;
 
     /// <summary>
     /// Numeric time-series per destination group address. Each telegram's decoded value is
@@ -41,6 +46,14 @@ public partial class TelegramsController
     /// At most 200 000 rows are read per request. When the range holds more, the <b>newest</b>
     /// rows win, the older end is missing and <c>truncated</c> is true — a chart is easier to
     /// distrust when it starts late than when it ends early.
+    /// </para>
+    /// <para>
+    /// <c>carry</c> is the last chartable value <b>before</b> <c>from</c> (with its original
+    /// timestamp), so a client can draw the curve from the left edge instead of starting it at
+    /// the first telegram inside the range, since a KNX value holds until the next telegram. It is null
+    /// when there is no earlier value, and always null when <c>truncated</c> is true, since the
+    /// missing older end would sit between it and the first point. An address with a carry value
+    /// but no telegram inside the range is returned with an empty <c>points</c> list.
     /// </para>
     /// <para>
     /// A timestamp without a zone designator (<c>from=2026-07-30T00:00:00</c>) is interpreted as
@@ -89,12 +102,32 @@ public partial class TelegramsController
             .GroupBy(t => t.DestinationAddress, StringComparer.Ordinal)
             .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
 
+        // Skipped when truncated: the carry value would then bridge the part that is missing.
+        var earlier = truncated
+            ? new Dictionary<string, IReadOnlyList<KnxMonitor.Core.Entities.KnxTelegram>>()
+            : await _repository.GetLatestBeforeAsync(addressList, rangeFrom, CarryLookback, ct);
+
         var series = new List<ChartSeries>();
         foreach (var address in addressList)
         {
-            if (!byAddress.TryGetValue(address, out var telegrams) || telegrams.Count == 0)
+            byAddress.TryGetValue(address, out var telegrams);
+            telegrams ??= new List<KnxMonitor.Core.Entities.KnxTelegram>();
+
+            ChartPoint? carry = null;
+            string carryUnit = string.Empty;
+            string? carryName = null;
+            if (earlier.TryGetValue(address, out var before))
             {
-                continue;
+                foreach (var t in before)
+                {
+                    if (TryExtractNumeric(t.ValueDecoded, out var carryValue))
+                    {
+                        carry = new ChartPoint { T = ToIsoUtc(t.Timestamp), V = carryValue };
+                        carryUnit = ExtractUnit(t.ValueDecoded);
+                        carryName = t.GroupAddress?.Name;
+                        break;
+                    }
+                }
             }
 
             string? name = null;
@@ -114,16 +147,12 @@ public partial class TelegramsController
                 }
                 points.Add(new ChartPoint
                 {
-                    // Timestamps come back from SQLite as Kind=Unspecified but hold the UTC wall
-                    // time (telegrams are saved with DateTime.UtcNow). ToUniversalTime() would
-                    // then wrongly subtract the local offset; tag as UTC instead so the "O" format
-                    // emits a correct trailing 'Z' and the client plots it at the right instant.
-                    T = DateTime.SpecifyKind(t.Timestamp, DateTimeKind.Utc).ToString("O", CultureInfo.InvariantCulture),
+                    T = ToIsoUtc(t.Timestamp),
                     V = value
                 });
             }
 
-            if (points.Count == 0)
+            if (points.Count == 0 && carry is null)
             {
                 continue;
             }
@@ -133,11 +162,12 @@ public partial class TelegramsController
             series.Add(new ChartSeries
             {
                 Address = address,
-                Name = name,
-                Unit = unit,
+                Name = name ?? carryName,
+                Unit = unit.Length > 0 ? unit : carryUnit,
                 DownSampled = downSampled,
                 TotalPoints = points.Count,
-                Points = sampled
+                Points = sampled,
+                Carry = carry
             });
         }
 
@@ -179,18 +209,10 @@ public partial class TelegramsController
         var bucketMs = totalMs / bucketCount;
 
         var ct = HttpContext.RequestAborted;
-        var counts = new long[bucketCount];
-        long total = 0;
-
-        await foreach (var ts in _repository.StreamTimestampsInRangeAsync(rangeFrom, rangeTo, ct))
-        {
-            total++;
-            var offset = (ts - rangeFrom).TotalMilliseconds;
-            var idx = (int)(offset / bucketMs);
-            if (idx < 0) idx = 0;
-            if (idx >= bucketCount) idx = bucketCount - 1;
-            counts[idx]++;
-        }
+        // Counted per bucket in SQL (#39): only the bucket counts cross into .NET instead of one
+        // timestamp per telegram, which took seconds for a 30-day range on a Pi.
+        var counts = await _repository.CountPerBucketAsync(rangeFrom, rangeTo, bucketCount, bucketMs, ct);
+        var total = counts.Sum();
 
         var bucketList = new List<StatsBucket>(bucketCount);
         for (var i = 0; i < bucketCount; i++)
@@ -243,20 +265,100 @@ public partial class TelegramsController
         var (rangeFrom, rangeTo) = ResolveRange(from, to);
         var ct = HttpContext.RequestAborted;
 
-        var grid = new long[7][];
-        for (var d = 0; d < 7; d++) grid[d] = new long[24];
-        long total = 0;
-
-        await foreach (var ts in _repository.StreamTimestampsInRangeAsync(rangeFrom, rangeTo, ct))
+        // The SQL counts one range per local hour, so its cost grows with the length of the range,
+        // not with the data. Clamp the range to what is stored (a typo like year 0202 would
+        // otherwise build millions of ranges) and the offset to real time zones (UTC-14..+14).
+        tz = Math.Clamp(tz, -840, 840);
+        var bounds = await _repository.GetTimestampBoundsAsync(ct);
+        if (bounds is not { } b || rangeTo < b.Oldest || rangeFrom > b.Newest)
         {
-            // ts holds the UTC wall time (Kind=Unspecified from SQLite); shift into local zone.
-            var local = DateTime.SpecifyKind(ts, DateTimeKind.Utc).AddMinutes(-tz);
-            grid[(int)local.DayOfWeek][local.Hour]++;
-            total++;
+            return Ok(new HeatmapResponse { Total = 0, Grid = EmptyHeatmapGrid() });
         }
+        if (rangeFrom < b.Oldest) rangeFrom = b.Oldest;
+        if (rangeTo > b.Newest) rangeTo = b.Newest;
+
+        // Counted per (weekday, hour) in SQL (#39): at most 168 rows instead of every timestamp.
+        var grid = await _repository.CountPerWeekdayHourAsync(rangeFrom, rangeTo, tz, ct);
+        var total = grid.Sum(row => row.Sum());
 
         return Ok(new HeatmapResponse { Total = total, Grid = grid });
     }
+
+    /// <summary>
+    /// The busiest destination group addresses and the busiest senders over [from,to], for the
+    /// bus-load breakdown in the statistics view.
+    /// </summary>
+    /// <remarks>
+    /// Both lists are ranked by telegram count, highest first, ties broken by address, and hold
+    /// at most <paramref name="limit"/> entries each. <c>share</c> is the percentage of all
+    /// telegrams in the range (<c>total</c>), <c>perHour</c> the count divided by the length of
+    /// the range in hours (<c>rangeHours</c>), so a short range is not mistaken for a quiet one.
+    /// <para>
+    /// Names and DPTs come from the <b>currently active</b> project: an address that is not part
+    /// of it, or a range recorded under an older project, shows whatever today's project says,
+    /// or null. Counts all telegrams in the range, every message type included.
+    /// </para>
+    /// <para>
+    /// A timestamp without a zone designator is interpreted as server local time, not UTC. Send
+    /// ISO-8601 with a trailing <c>Z</c> to be unambiguous.
+    /// </para>
+    /// </remarks>
+    /// <param name="from">Start of the range (inclusive). Defaults to 24 hours before <c>to</c>.</param>
+    /// <param name="to">End of the range (inclusive). Defaults to now. A reversed range is swapped, not rejected.</param>
+    /// <param name="limit">Entries per list. Default 20, clamped to 1..100.</param>
+    [HttpGet("top")]
+    public async Task<IActionResult> GetTop(
+        [FromQuery] DateTime? from,
+        [FromQuery] DateTime? to,
+        [FromQuery] int limit = DefaultTopLimit)
+    {
+        var (rangeFrom, rangeTo) = ResolveRange(from, to);
+        var take = Math.Clamp(limit, 1, MaxTopLimit);
+        var ct = HttpContext.RequestAborted;
+
+        // Sequential on purpose: the repository shares one DbContext, which allows a single
+        // active query at a time.
+        var total = await _repository.CountInRangeAsync(rangeFrom, rangeTo, ct);
+        var destinations = await _repository.GetTopDestinationsAsync(rangeFrom, rangeTo, take, ct);
+        var sources = await _repository.GetTopSourcesAsync(rangeFrom, rangeTo, take, ct);
+
+        var hours = Math.Max((rangeTo - rangeFrom).TotalHours, 1.0 / 3600);
+        double Share(long count) => total > 0 ? count * 100.0 / total : 0;
+
+        return Ok(new TopResponse
+        {
+            Total = total,
+            RangeHours = hours,
+            GroupAddresses = destinations.Select(d =>
+            {
+                var ga = _projectCache.GetByAddress(d.Address);
+                return new TopEntry
+                {
+                    Address = d.Address,
+                    Name = string.IsNullOrEmpty(ga?.Name) ? null : ga.Name,
+                    Dpt = ga?.DatapointType,
+                    Count = d.Count,
+                    Share = Share(d.Count),
+                    PerHour = d.Count / hours
+                };
+            }).ToList(),
+            Senders = sources.Select(s =>
+            {
+                var device = _projectCache.GetDeviceByAddress(s.Address);
+                return new TopEntry
+                {
+                    Address = s.Address,
+                    Name = string.IsNullOrEmpty(device?.Name) ? null : device.Name,
+                    Count = s.Count,
+                    Share = Share(s.Count),
+                    PerHour = s.Count / hours
+                };
+            }).ToList()
+        });
+    }
+
+    private static long[][] EmptyHeatmapGrid() =>
+        Enumerable.Range(0, 7).Select(_ => new long[24]).ToArray();
 
     private static (DateTime From, DateTime To) ResolveRange(DateTime? from, DateTime? to)
     {
@@ -349,6 +451,13 @@ public partial class TelegramsController
     /// leading minus and a decimal point/comma), else a known boolean/enum word → 1/0. Returns
     /// false when nothing chartable is present.
     /// </summary>
+    // Timestamps come back from SQLite as Kind=Unspecified but hold the UTC wall time (telegrams
+    // are saved with DateTime.UtcNow). ToUniversalTime() would then wrongly subtract the local
+    // offset; tag as UTC instead so the "O" format emits a correct trailing 'Z' and the client
+    // plots it at the right instant.
+    private static string ToIsoUtc(DateTime timestamp) =>
+        DateTime.SpecifyKind(timestamp, DateTimeKind.Utc).ToString("O", CultureInfo.InvariantCulture);
+
     internal static bool TryExtractNumeric(string? decoded, out double value)
     {
         value = 0;
@@ -418,6 +527,12 @@ public class ChartSeries
     public int TotalPoints { get; set; }
 
     public List<ChartPoint> Points { get; set; } = new();
+
+    /// <summary>
+    /// Last chartable value before the range start, with its original timestamp; null when there
+    /// is none or the result is truncated. Not part of <see cref="Points"/> or <see cref="TotalPoints"/>.
+    /// </summary>
+    public ChartPoint? Carry { get; set; }
 }
 
 public class ChartPoint
@@ -437,6 +552,41 @@ public class StatsBucket
 {
     public string T { get; set; } = string.Empty;
     public long Count { get; set; }
+}
+
+public class TopResponse
+{
+    /// <summary>All telegrams in the range, the base of every <c>share</c>.</summary>
+    public long Total { get; set; }
+
+    /// <summary>Length of the range in hours, the base of every <c>perHour</c>.</summary>
+    public double RangeHours { get; set; }
+
+    /// <summary>Busiest destination group addresses, highest count first.</summary>
+    public List<TopEntry> GroupAddresses { get; set; } = new();
+
+    /// <summary>Busiest source devices (individual addresses), highest count first.</summary>
+    public List<TopEntry> Senders { get; set; } = new();
+}
+
+public class TopEntry
+{
+    /// <summary>Group address (<c>1/2/3</c>) or individual address (<c>1.1.5</c>).</summary>
+    public string Address { get; set; } = string.Empty;
+
+    /// <summary>GA or device name from the active project; null when it has none.</summary>
+    public string? Name { get; set; }
+
+    /// <summary>Datapoint type of the GA from the active project; always null for senders.</summary>
+    public string? Dpt { get; set; }
+
+    public long Count { get; set; }
+
+    /// <summary>Percentage of all telegrams in the range, 0..100.</summary>
+    public double Share { get; set; }
+
+    /// <summary>Average telegrams per hour over the whole range.</summary>
+    public double PerHour { get; set; }
 }
 
 public class HeatmapResponse

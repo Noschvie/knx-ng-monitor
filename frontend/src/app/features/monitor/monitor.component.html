@@ -62,7 +62,7 @@
       <!-- Shared quick-search (applies in both modes) -->
       <div class="knx-field" style="width: 230px;">
         <mat-icon class="field-icon" svgIcon="knx:search"></mat-icon>
-        <input class="knx-input knx-input--search" type="text" [(ngModel)]="quickFilterText"
+        <input class="knx-input knx-input--search" type="text" knxSlashFocus [matTooltip]="'common.slashHint' | translate" matTooltipShowDelay="600" [(ngModel)]="quickFilterText"
                (ngModelChange)="onQuickFilterChanged()" [placeholder]="'monitor.search' | translate" [attr.aria-label]="'monitor.searchAria' | translate">
         @if (quickFilterText) {
           <button class="field-clear" (click)="clearQuickFilter()" [attr.aria-label]="'monitor.clearSearch' | translate">
@@ -216,12 +216,19 @@
         }
         <input class="knx-input" style="width: 150px;" [(ngModel)]="address" [placeholder]="'monitor.filter.destGa' | translate" (keyup.enter)="applyFilters()">
         <input class="knx-input" style="width: 150px;" [(ngModel)]="source" [placeholder]="'monitor.filter.source' | translate" (keyup.enter)="applyFilters()">
-        <input class="knx-input" style="width: 190px;" type="datetime-local" [(ngModel)]="fromValue" [attr.aria-label]="'monitor.filter.from' | translate">
-        <input class="knx-input" style="width: 190px;" type="datetime-local" [(ngModel)]="toValue" [attr.aria-label]="'monitor.filter.to' | translate">
+        <div class="fb-dt" role="group" [attr.aria-label]="'monitor.filter.from' | translate">
+          <span class="fb-label" aria-hidden="true">{{ 'monitor.filter.from' | translate }}</span>
+          <knx-date-time-field [label]="'monitor.filter.from' | translate" [(ngModel)]="fromValue" (edited)="onDateEdited()" />
+        </div>
+        <div class="fb-dt" role="group" [attr.aria-label]="'monitor.filter.to' | translate">
+          <span class="fb-label" aria-hidden="true">{{ 'monitor.filter.to' | translate }}</span>
+          <knx-date-time-field [label]="'monitor.filter.to' | translate" defaultTime="23:59"
+                               [min]="fromValue" [(ngModel)]="toValue" (edited)="onDateEdited()" />
+        </div>
 
         <span class="fb-sep"></span>
 
-        <button class="knx-btn knx-btn--primary" (click)="applyFilters(); filtersExpanded = false">
+        <button class="knx-btn knx-btn--primary" (click)="filtersExpanded = !applyFilters()">
           <mat-icon svgIcon="knx:search"></mat-icon>
           {{ 'monitor.filter.apply' | translate }}
         </button>

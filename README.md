@@ -148,16 +148,16 @@ A ~4-minute guided walkthrough of every feature on YouTube. The app UI itself is
 
 ## Features
 
-- **Real-time KNX monitoring** - live view of bus telegrams via SignalR, over KNXnet/IP **tunneling or routing**, **always-on**: auto-connects on startup and reconnects after gateway/network/container interruptions
+- **Real-time KNX monitoring** - live view of bus telegrams via SignalR, over KNXnet/IP **tunneling (UDP or TCP) or routing**, **always-on**: auto-connects on startup and reconnects after gateway/network/container interruptions, rides out short dropouts on the tunnel; optional fixed tunnel address with fallback, host name or IP for the interface
 - **DPT decoding** - via the Falcon datapoint catalog: full DPT range, sub-type aware, with units and enumeration names (English labels, locale-invariant numbers)
 - **ETS project import** - ETS 4 / 5 / 6 `.knxproj` files up to ETS 6.4 (project schema 23), three- / two-level / free addressing
 - **KNX Secure** - password-protected projects (incl. ETS6 PBKDF2/AES wrapping) and `.knxkeys` keyring decryption; **Data Secure** group telegrams decrypted at runtime, optional opt-in IP-Secure tunnel
-- **Unified Monitor view** - one view with a **Live / Archive** toggle and a shared filter; custom virtual-scroll grid with color-coding (Read / Write / Response), value semantics + DPST units, live bus-load badge (msg/s + %), pause (no telegram loss), auto-scroll, free-text + room filter
-- **Charts & statistics** - time-series charts for numeric DPTs (separate Y-axes per unit, live append), a statistics view (total, average msg/s, telegrams over time) and a weekday × hour activity heatmap
-- **Topology & group-address tree** - Locations (building → floor → room) and com-objects parsed across ETS 4/5/6, a Topology tree view, a 3-level group-address tree, a room filter and a "used by" device list; plus a force-directed **GA network graph (Alpha)**
+- **Unified Monitor view** - one view with a **Live / Archive** toggle and a shared filter; custom virtual-scroll grid with color-coding (Read / Write / Response), value semantics + DPST units, live bus-load badge (msg/s + %), pause (no telegram loss), auto-scroll, free-text + room filter; opt-in columns for the sender name, the sender's building part and the ETS functions of the destination
+- **Charts & statistics** - time-series charts for numeric DPTs (one Y-axis per unit, live window, tooltip across all series, saved group-address selections), a statistics view (total, average msg/s, telegrams over time, top group addresses and senders) and a weekday × hour activity heatmap, all counted in the database
+- **Topology & group-address tree** - Locations (building → floor → room) and com-objects parsed across ETS 4/5/6, a Topology tree view, a 3-level group-address tree, a room filter and a "used by" device list; plus a force-directed **GA network graph (Alpha)** with group, room, DPT and neighbourhood filters
 - **Write / read from the UI** - send a GroupValueRead or write a DPT-typed value to the live bus from the detail drawer, behind a confirmation dialog
-- **Data recording** - two-tier, fully self-contained: count-based SQLite hot-tier ring buffer (bounded size) plus an opt-in NDJSON+gzip long-term archive; keyset-paginated query API and server-streamed CSV export
-- **Runtime DE / EN** - full bilingual UI, switchable without a reload
+- **Data recording** - two-tier, fully self-contained: count-based SQLite hot-tier ring buffer (bounded size) plus an opt-in NDJSON+gzip long-term archive; optional buffered writes (every 5 s up to 10 min) to spare SD cards; keyset-paginated query API and server-streamed CSV export
+- **Runtime DE / EN** - full bilingual UI, switchable without a reload; dates follow the browser's regional settings, always 24-hour
 - **JWT auth** - access tokens (15 min) + refresh tokens (7 days), secret auto-generated on first start
 - **Single-port deployment** - backend serves the Angular frontend in production
 
@@ -201,9 +201,19 @@ services:
     restart: unless-stopped
     # environment:
     #   - TZ=Europe/Berlin   # log time zone, UTC if unset
+    #   - PUID=1000          # owner of ./data on the host (see below)
+    #   - PGID=1000
     ports: ["8080:8080"]
     volumes: ["./data:/app/data"]
+    # network_mode: host     # needed for routing (multicast); then drop "ports"
 ```
+
+**Permissions of `./data`.** The container starts as root, hands `/app/data` to `PUID:PGID`
+(default `1000:1000`) and then runs the application as that user, never as root. So a data
+directory that Docker created as root, or one that belongs to another user on your NAS, works
+without manual `chown`: set `PUID`/`PGID` to the owner you want (`id -u` / `id -g` on the host).
+If you start the container with `--user` (or `user:` in compose) instead, that user must already
+be able to write to `./data`; otherwise the container stops right away with a message saying so.
 
 ### Self-contained binary (no .NET required)
 
@@ -219,6 +229,15 @@ tar -xzf knx-ng-monitor-linux-x64.tar.gz
 
 Windows: download `knx-ng-monitor-win-x64.zip` (or `-win-arm64.zip`), extract,
 run `KnxMonitor.Api.exe`.
+
+### Home Assistant add-on (community)
+
+[devTabSel/HAOS-knx-ng-monitor](https://github.com/devTabSel/HAOS-knx-ng-monitor)
+wraps the Docker image as a Home Assistant OS add-on. It is a community project,
+maintained outside this repository, and follows new releases automatically. There
+is no Ingress: open the UI on the port the add-on publishes instead of from the
+HA sidebar. For KNXnet/IP routing see the `host_network` note under
+[KNX connection](#knx-connection).
 
 ### First-time setup
 
@@ -249,6 +268,7 @@ types and room/building context. The two-stage wizard walks through:
 |---|---|---|
 | `ASPNETCORE_ENVIRONMENT` | `Production` | `Development` enables CORS for `:4200`, the separate dev server and the scalar/v1 API docs |
 | `ASPNETCORE_URLS` | `http://0.0.0.0:8080` | Listen URL - change to use a different port. Up to 0.10.0 the shipped `appsettings.json` pinned the endpoint and silently outranked this variable; it is honoured now. Alternatives: `ASPNETCORE_HTTP_PORTS`, `ASPNETCORE_HTTPS_PORTS`, `Kestrel__Endpoints__Http__Url`, or a `Urls` key in `appsettings.json` - each of them wins over the default. The Docker image sets the equivalent `http://+:8080`; inside a container leave the port at 8080 (the `HEALTHCHECK` probes it) and remap on the host with `-p HOST:8080` |
+| `PUID` / `PGID` | `1000` / `1000` | Docker only: user and group the application runs as, and that `/app/data` is handed to on start (see [Docker](#docker-recommended)) |
 | `KNX_LOG_LEVEL` | `Information` | Log verbosity: `Verbose`, `Debug`, `Information`, `Warning`, `Error`, `Fatal` (see [Logging & diagnostics](#logging--diagnostics)) |
 | `TZ` | unset | Timezone used by the container for log timestamps and for the daily rollover of the log files, as a [tz database name](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones#List) such as `Europe/Berlin`. A container has no time zone of its own, so without this variable the log reads UTC; the self-contained binary follows the machine's zone. Telegram times in the UI are not affected |
 
@@ -333,7 +353,23 @@ Thanks for testing!
 
 ## Project status
 
-**Current - v0.12.0:** ETS 4 projects finally import with datapoint types (#24). The type
+**Current - v0.13.1:** a big round of community feedback. The **tunnel survives a bad
+network link** (#22): Falcon's auto-reconnect is on, a lost link is rebuilt right away with
+a short backoff instead of waiting for the next poll, the transport is selectable (UDP or
+**TCP**), and the interface can be asked for a **fixed tunnel address** with a fallback to any
+free slot (#10); a host name works in place of the IP (#23). **Buffered history writes**
+(every 5 s up to 10 min) spare SD cards (#37), and statistics are **counted in SQLite**
+instead of streaming every timestamp into .NET, about 7x faster on a million telegrams
+(#39), with a new card for the **busiest group addresses and senders** (#38). The charts
+got one y-axis per unit, a tooltip across all series, saved selections, a moving live window
+and the value in force before the range, much of it contributed by Elkomaster91 (#27, #30,
+#32, #33, #35, #36). Also new: an in-app **date and time field** that no longer accepts
+six-digit years (#15, #41), dates in the browser's regional format (#42), word-based search
+everywhere with `/` to focus it (#34), filters in the GA graph (#17), building-part and
+function columns in the monitor (#12), and **PUID / PGID** for the Docker image, so a
+root-owned bind mount no longer needs a manual `chown` (#40). Runs on **.NET 10 LTS** (#16).
+
+**Previous - v0.12.0:** ETS 4 projects finally import with datapoint types (#24). The type
 was only ever read from the group address, where ETS 4 never puts it - so the value column
 stayed empty and the charts page reported nothing to plot. It is now resolved through the
 linked communication object and the manufacturer's application program in the archive, and

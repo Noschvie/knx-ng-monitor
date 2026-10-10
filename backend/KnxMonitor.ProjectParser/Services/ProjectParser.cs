@@ -1,4 +1,4 @@
-﻿using System.Xml.Linq;
+using System.Xml.Linq;
 using KnxMonitor.ProjectParser.Core.Enums;
 using KnxMonitor.ProjectParser.Core.Interfaces;
 using KnxMonitor.ProjectParser.Core.Models;
@@ -33,18 +33,33 @@ public class ProjectParser : IProjectParser
         CancellationToken cancellationToken = default)
     {
         var startTime = DateTime.UtcNow;
+        ProjectFileMap? files = null;
 
         try
         {
-            // 1. Detect features
+            // 1. Detect features. The library's own detector also hands back the outer archive
+            //    index with the 0.xml it already parsed; without a password that index is the
+            //    project, so the loader reuses the document instead of parsing it a second time.
             ReportProgress(progress, ParseStep.DetectFeatures, 0);
-            var features = await _featureDetector.DetectAsync(stream, cancellationToken);
+            ProjectFeatures features;
+            if (_featureDetector is FeatureDetector detector)
+            {
+                (features, var outerFiles) = await detector.DetectKeepingFilesAsync(stream, cancellationToken);
+                if (features.HasPassword)
+                    outerFiles.Dispose();
+                else
+                    files = outerFiles;
+            }
+            else
+            {
+                features = await _featureDetector.DetectAsync(stream, cancellationToken);
+            }
 
             // 2. Open ZIP (mit Password falls nötig). Läuft VOR der Loader-Auswahl, damit eine
             //    unbekannte ETS-Version noch aus den entpackten Projektdateien nachgezogen werden
             //    kann — bei passwortgeschützten Projekten sind die vorher nicht lesbar.
             ReportProgress(progress, ParseStep.OpenZip, 0);
-            using var files = await ZipHandler.LoadAsync(
+            files ??= await ZipHandler.LoadAsync(
                 stream,
                 features,
                 options.Password,
@@ -95,6 +110,7 @@ public class ProjectParser : IProjectParser
                 GroupAddressCount = result.GroupAddresses.Count,
                 DeviceCount = result.Devices.Count,
                 LocationCount = result.Locations.Count,
+                FunctionCount = result.Functions.Count,
                 CommunicationObjectCount = result.CommunicationObjects.Count
             };
 
@@ -113,6 +129,10 @@ public class ProjectParser : IProjectParser
         {
             _logger.LogError(ex, "Failed to parse project");
             throw;
+        }
+        finally
+        {
+            files?.Dispose();
         }
     }
 
@@ -144,8 +164,7 @@ public class ProjectParser : IProjectParser
                 XDocument xml;
                 try
                 {
-                    await using var stream = files.OpenRead(path);
-                    xml = await XDocument.LoadAsync(stream, LoadOptions.None, cancellationToken);
+                    xml = await files.LoadXmlAsync(path, cancellationToken);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {

@@ -1,7 +1,7 @@
-import { Component, OnInit, OnDestroy, AfterViewInit, ElementRef, NgZone, inject, ViewChild, HostListener } from '@angular/core';
+import { Component, OnInit, OnDestroy, AfterViewInit, ElementRef, NgZone, inject, ViewChild, ViewChildren, QueryList, HostListener } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { FormsModule } from '@angular/forms';
-import { Router } from '@angular/router';
+import { ActivatedRoute, Router } from '@angular/router';
 import { MatIconModule } from '@angular/material/icon';
 import { MatButtonModule } from '@angular/material/button';
 import { MatTooltipModule } from '@angular/material/tooltip';
@@ -24,12 +24,15 @@ import { ColumnManagerComponent } from '../../shared/grid/column-manager.compone
 import { messageTypeName } from '../../shared/grid/knx-grid.util';
 import { LanguageService } from '../../core/i18n/language.service';
 import { TranslatePipe } from '../../core/i18n/translate.pipe';
+import { DateTimeFieldComponent } from '../../shared/date-time-field/date-time-field.component';
 import { localeTag } from '../../core/i18n/locale.util';
 import { formatKnxDate } from '../../core/i18n/date.util';
 import { LoggerService } from '../../core/logging/logger.service';
 import { ProjectService, LocationDto } from '../../core/services/project.service';
 import { DiagnosticsService } from '../../core/services/diagnostics.service';
 import { formatDurationMinutes } from '../../shared/duration.util';
+import { SearchCache, searchTokens } from '../../shared/search.util';
+import { SlashFocusDirective } from '../../shared/slash-focus.directive';
 
 interface KnxConfiguration {
   id: number;
@@ -53,7 +56,8 @@ type MonitorMode = 'live' | 'archive';
   imports: [
     CommonModule, FormsModule, MatIconModule, MatButtonModule, MatTooltipModule,
     MatMenuModule, MatSnackBarModule,
-    TelegramCardsComponent, KnxTableComponent, ColumnManagerComponent, TranslatePipe
+    TelegramCardsComponent, KnxTableComponent, ColumnManagerComponent, TranslatePipe,
+    DateTimeFieldComponent, SlashFocusDirective
   ],
   templateUrl: './monitor.component.html',
   styleUrl: './monitor.component.scss'
@@ -64,6 +68,7 @@ export class MonitorComponent implements OnInit, OnDestroy, AfterViewInit {
   private historyService = inject(TelegramHistoryService);
   private http = inject(HttpClient);
   private router = inject(Router);
+  private route = inject(ActivatedRoute);
   private snackBar = inject(MatSnackBar);
   private dialog = inject(MatDialog);
   private detail = inject(TelegramDetailService);
@@ -75,6 +80,7 @@ export class MonitorComponent implements OnInit, OnDestroy, AfterViewInit {
   private subscription?: Subscription;
 
   @ViewChild(KnxTableComponent) table?: KnxTableComponent;
+  @ViewChildren(DateTimeFieldComponent) private dateFields?: QueryList<DateTimeFieldComponent>;
   @ViewChild('gridScroll') gridScrollRef?: ElementRef<HTMLElement>;
 
   /** "Scroll to top" FAB — visible once the active scroll body is scrolled down. */
@@ -112,6 +118,12 @@ export class MonitorComponent implements OnInit, OnDestroy, AfterViewInit {
 
   // --- Shared quick-search (gilt in beiden Modi) -----------------------------
   quickFilterText = '';
+  // Live-Modus: wortweise Suche wie in der GA-Auswahl der Diagramme. Jedes Telegramm wird nur
+  // einmal gefaltet, nicht bei jedem neuen Telegramm im Puffer erneut.
+  private liveSearchCache = new SearchCache<KnxTelegram>((t) =>
+    [t.sourceAddress, t.sourceName, t.sourceLocationPath, t.destinationAddress, t.groupAddressName,
+      ...(t.functions ?? []), t.datapointType, t.value, t.valueDecoded]
+      .join(' '));
 
   // --- Live state ------------------------------------------------------------
   filtered: KnxTelegram[] = [];
@@ -140,8 +152,10 @@ export class MonitorComponent implements OnInit, OnDestroy, AfterViewInit {
   get isPaused(): boolean { return this.buffer.isPaused; }
 
   // Live-Rate / Bus-Last (gleitendes Fenster im Buffer-Service berechnet).
-  get messagesPerSecond(): number { return this.buffer.messagesPerSecond; }
-  get busLoadPercent(): number { return this.buffer.busLoadPercent; }
+  // Snapshots taken on each rate tick: the buffer's getters slide with the clock, so reading them
+  // straight from the template changed between two checks (NG0100 in dev mode).
+  messagesPerSecond = 0;
+  busLoadPercent = 0;
   private rateSub?: Subscription;
   private clearCountSub?: Subscription;
 
@@ -168,7 +182,8 @@ export class MonitorComponent implements OnInit, OnDestroy, AfterViewInit {
   address = '';
   source = '';
   types = new Set<string>();
-  timeRange: 'all' | 'hour' | 'today' | '7d' = 'all';
+  /** 'custom' = a range set by hand or by a deep link; no chip is active then. */
+  timeRange: 'all' | 'hour' | 'today' | '7d' | 'custom' = 'all';
   // Terms match the (often German) group-address names in the imported project,
   // so only the display labels are translated — not the search terms.
   // label = Übersetzungs-Key (Template übersetzt); term = Suchbegriff, bleibt as-is
@@ -200,8 +215,10 @@ export class MonitorComponent implements OnInit, OnDestroy, AfterViewInit {
     { key: 'timestamp', header: 'columns.timestamp', kind: 'datetime', width: 220, sortable: true },
     { key: 'sourceAddress', header: 'columns.source', kind: 'mono', width: 105 },
     { key: 'sourceName', header: 'columns.sourceName', kind: 'name', grow: 1, minWidth: 150 },
+    { key: 'sourceLocation', header: 'columns.sourceLocation', kind: 'location', grow: 1, minWidth: 150 },
     { key: 'destinationAddress', header: 'columns.dest', kind: 'mono', width: 105 },
     { key: 'groupAddressName', header: 'columns.name', kind: 'name', grow: 1.4, minWidth: 200 },
+    { key: 'functions', header: 'columns.functions', kind: 'functions', grow: 1, minWidth: 150 },
     { key: 'datapointType', header: 'columns.dpt', kind: 'dpt', width: 120, align: 'right' },
     { key: 'messageType', header: 'columns.type', kind: 'type', width: 110 },
     { key: 'value', header: 'columns.raw', kind: 'muted-mono', width: 140, align: 'right' },
@@ -211,7 +228,9 @@ export class MonitorComponent implements OnInit, OnDestroy, AfterViewInit {
   ];
   // sourceName ist zuschaltbar statt vorbelegt: die volle Spaltenliste braucht schon ohne sie
   // ~1162 px, ein weiteres Namensfeld drängt auf Laptop-Breiten die Wert-Spalte heraus.
-  readonly defaultHiddenCols = ['priority', 'flags', 'sourceName'];
+  // Gebäudeteil und Funktion (#12) aus demselben Grund; die seen-Liste im Spalten-Manager blendet
+  // sie auch bei bestehenden Nutzern erst einmal aus.
+  readonly defaultHiddenCols = ['priority', 'flags', 'sourceName', 'sourceLocation', 'functions'];
   columnOptions = this.allColumns.map((c) => ({ key: c.key as string, header: c.header }));
   hiddenCols = new Set<string>();
   readonly lockedCols = ['groupAddressName', 'valueDecoded'];
@@ -262,13 +281,20 @@ export class MonitorComponent implements OnInit, OnDestroy, AfterViewInit {
   onHiddenChange(hidden: Set<string>): void { this.hiddenCols = hidden; }
 
   async ngOnInit(): Promise<void> {
+    // Deep-Link ins Archiv (z. B. aus der Statistik, #38) zuerst übernehmen: so startet die
+    // Ansicht gar nicht erst im Live-Modus, und Zähler und erste Seite kommen schon gefiltert.
+    this.applyQueryParams();
+
     // Live-Buffer immer starten — läuft als Singleton im Hintergrund weiter.
     await this.buffer.start();
     this.applyClientFilter();
     if (this.mode === 'live' && this.autoScroll) setTimeout(() => this.table?.scrollToTop(), 0);
     this.subscription = this.buffer.changed$.subscribe(() => this.onBufferChanged());
     // Rate-/Bus-Last-Ticks (1×/s) sichtbar halten, auch ohne neue Telegramme.
-    this.rateSub = this.buffer.rate$.subscribe();
+    this.rateSub = this.buffer.rate$.subscribe(() => {
+      this.messagesPerSecond = this.buffer.messagesPerSecond;
+      this.busLoadPercent = this.buffer.busLoadPercent;
+    });
     this.checkConnectionStatus();
     this.checkSetupStatus();
     // Status periodisch pollen, damit Auto-Reconnect im Indikator sichtbar wird.
@@ -309,6 +335,45 @@ export class MonitorComponent implements OnInit, OnDestroy, AfterViewInit {
     this.clearCountSub?.unsubscribe();
     if (this.statusPoll) clearInterval(this.statusPoll);
     this.gridScrollRef?.nativeElement.removeEventListener('scroll', this.onCaptureScroll, true);
+  }
+
+  /**
+   * Versteht `?mode=archive&address=1/2/3&source=1.1.5&from=<ISO>&to=<ISO>`. Alle Parameter
+   * sind optional; `from`/`to` sind Zeitpunkte (ISO mit Z) und landen als lokale Zeit in den
+   * Datumsfeldern, wie eine Eingabe von Hand. Unlesbare Werte werden ignoriert.
+   */
+  private applyQueryParams(): void {
+    const q = this.route.snapshot.queryParamMap;
+    const address = q.get('address')?.trim();
+    const source = q.get('source')?.trim();
+    const from = this.parseInstant(q.get('from'));
+    const to = this.parseInstant(q.get('to'));
+
+    if (address) this.address = address;
+    if (source) this.source = source;
+    if (from) this.fromValue = this.toLocalInput(from);
+    if (to) this.toValue = this.toLocalInput(to);
+
+    if (from || to) this.timeRange = 'custom';
+
+    if (q.get('mode') === 'archive' || address || source || from || to) {
+      this.mode = 'archive';
+      // Mobil ist die Filterleiste sonst zugeklappt und der gesetzte Filter unsichtbar.
+      this.filtersExpanded = true;
+      void this.loadRoomsIfNeeded();
+    }
+
+    // Die Parameter sind nur der Einstieg: aus der URL entfernen, sonst stellt ein Reload später
+    // den alten Filter wieder her, obwohl längst etwas anderes eingestellt ist.
+    if (q.keys.length) {
+      void this.router.navigate([], { relativeTo: this.route, queryParams: {}, replaceUrl: true });
+    }
+  }
+
+  private parseInstant(value: string | null): Date | null {
+    if (!value) return null;
+    const d = new Date(value);
+    return isNaN(d.getTime()) ? null : d;
   }
 
   // --- Mode toggle -----------------------------------------------------------
@@ -376,11 +441,9 @@ export class MonitorComponent implements OnInit, OnDestroy, AfterViewInit {
   }
 
   applyClientFilter(): void {
-    const q = this.quickFilterText.trim().toLowerCase();
-    this.filtered = q
-      ? this.telegrams.filter((t) =>
-          [t.sourceAddress, t.sourceName, t.destinationAddress, t.groupAddressName, t.datapointType, t.value, t.valueDecoded]
-            .join(' ').toLowerCase().includes(q))
+    const tokens = searchTokens(this.quickFilterText);
+    this.filtered = tokens.length
+      ? this.telegrams.filter((t) => this.liveSearchCache.matches(t, tokens))
       : this.telegrams.slice();
   }
 
@@ -389,12 +452,13 @@ export class MonitorComponent implements OnInit, OnDestroy, AfterViewInit {
   clearTelegrams(): void { this.buffer.clear(); }
 
   exportLiveCsv(): void {
-    const header = ['Time', 'Source', 'SourceName', 'Dest', 'Name', 'DPT', 'Type', 'Raw', 'Value'];
+    const header = ['Time', 'Source', 'SourceName', 'SourceLocation', 'Dest', 'Name', 'Functions', 'DPT', 'Type', 'Raw', 'Value'];
     const lines = [header.join(',')];
     for (const t of this.filtered) {
       lines.push([
         formatKnxDate(t.timestamp, 'dateTime', this.lang.lang()),
-        t.sourceAddress, t.sourceName ?? '', t.destinationAddress, t.groupAddressName ?? '', t.datapointType ?? '',
+        t.sourceAddress, t.sourceName ?? '', t.sourceLocationPath ?? '', t.destinationAddress, t.groupAddressName ?? '',
+        (t.functions ?? []).join('; '), t.datapointType ?? '',
         messageTypeName(t.messageType), t.value, t.valueDecoded ?? ''
       ].map((v) => this.csv(String(v ?? ''))).join(','));
     }
@@ -504,12 +568,32 @@ export class MonitorComponent implements OnInit, OnDestroy, AfterViewInit {
     });
   }
 
-  applyFilters(): void {
+  /** Liefert false, wenn der Filter abgelehnt wurde (Ende vor Start). */
+  applyFilters(): boolean {
+    // Ein unlesbares Datum ergibt '' und würde sonst als "keine Grenze" das ganze Archiv abfragen.
+    if (this.dateFields?.some(f => f.hasInvalidInput || f.hasIncompleteInput)) {
+      this.toast(this.lang.translate('monitor.filter.invalidDate'));
+      return false;
+    }
+    // Ein Zeitraum mit Ende vor dem Start liefert nie etwas; das Bis-Feld ist bereits rot markiert.
+    const from = this.toIso(this.fromValue);
+    const to = this.toIso(this.toValue);
+    if (from && to && from > to) {
+      this.toast(this.lang.translate('range.orderHint'));
+      return false;
+    }
     this.loadCount();
     this.resetArchive();
+    return true;
+  }
+
+  /** A date typed by hand no longer matches a quick-range chip. */
+  onDateEdited(): void {
+    this.timeRange = 'custom';
   }
 
   resetFilters(): void {
+    this.dateFields?.forEach(f => f.clear());
     this.fromValue = '';
     this.toValue = '';
     this.address = '';
@@ -559,6 +643,9 @@ export class MonitorComponent implements OnInit, OnDestroy, AfterViewInit {
   }
 
   setTimeRange(range: 'all' | 'hour' | 'today' | '7d'): void {
+    // Empty the fields first (also unreadable text): the new values reach them via ngModel only
+    // in the next tick, so applyFilters below would otherwise still see the old invalid input.
+    this.dateFields?.forEach(f => f.clear());
     this.timeRange = range;
     const now = new Date();
     let from: Date | null = null;

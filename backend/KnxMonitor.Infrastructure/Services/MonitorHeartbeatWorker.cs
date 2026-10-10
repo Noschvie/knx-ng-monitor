@@ -27,6 +27,7 @@ public class MonitorHeartbeatWorker : BackgroundService
     private static readonly TimeSpan RetentionInterval = TimeSpan.FromHours(6);
 
     private readonly IKnxConnectionService _knx;
+    private readonly ITelegramQueue _queue;
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ILogger<MonitorHeartbeatWorker> _logger;
 
@@ -35,10 +36,12 @@ public class MonitorHeartbeatWorker : BackgroundService
 
     public MonitorHeartbeatWorker(
         IKnxConnectionService knx,
+        ITelegramQueue queue,
         IServiceScopeFactory scopeFactory,
         ILogger<MonitorHeartbeatWorker> logger)
     {
         _knx = knx;
+        _queue = queue;
         _scopeFactory = scopeFactory;
         _logger = logger;
     }
@@ -87,14 +90,28 @@ public class MonitorHeartbeatWorker : BackgroundService
         var count = Interlocked.Exchange(ref _telegramsSinceLastBeat, 0);
         try
         {
-            using var scope = _scopeFactory.CreateScope();
-            var repo = scope.ServiceProvider.GetRequiredService<IMonitorHeartbeatRepository>();
-            await repo.AddAsync(new MonitorHeartbeat
+            var beat = new MonitorHeartbeat
             {
                 Timestamp = DateTime.UtcNow,
                 State = _knx.State,
                 TelegramsSinceLast = count
-            });
+            };
+
+            // With buffered history writes the beat travels with the telegrams (#37), otherwise a
+            // power cut would leave beats for minutes whose telegrams never reached the disk.
+            switch (_queue.TryEnqueueHeartbeat(beat))
+            {
+                case HeartbeatEnqueueResult.Enqueued:
+                    return;
+                case HeartbeatEnqueueResult.Dropped:
+                    // Queue full: keep the count for the next beat instead of losing it.
+                    Interlocked.Add(ref _telegramsSinceLastBeat, count);
+                    return;
+            }
+
+            using var scope = _scopeFactory.CreateScope();
+            var repo = scope.ServiceProvider.GetRequiredService<IMonitorHeartbeatRepository>();
+            await repo.AddAsync(beat);
         }
         catch (Exception ex)
         {

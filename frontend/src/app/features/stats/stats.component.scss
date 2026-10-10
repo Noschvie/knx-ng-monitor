@@ -75,17 +75,12 @@
   color: var(--err);
 }
 
-.knx-input.is-missing {
-  border-color: var(--err);
-  box-shadow: 0 0 0 3px var(--err-tint);
-}
-
 // Filter controls all share the same height + vertical centre so presets, date
 // inputs and the apply button line up on one baseline (and wrap cleanly).
 .tb-right {
   .knx-seg,
   .knx-btn,
-  .range-field .knx-input { height: 36px; }
+  .range-field knx-date-time-field { --dtf-height: 36px; }
 }
 
 .range-field {
@@ -98,10 +93,8 @@
 
   > span { flex: none; }
 
-  .knx-input {
-    height: 36px;
-    width: auto;
-  }
+  // Fits dd.mm.yyyy, hh:mm and the calendar button in the mono font.
+  knx-date-time-field { width: 200px; }
 }
 
 .knx-btn.is-active {
@@ -173,6 +166,126 @@
     position: relative;
     display: flex;
   }
+}
+
+// --- Top group addresses / senders (#38) -------------------------------------
+// Sized by its rows rather than stretched like the chart cards; the table scrolls sideways on
+// its own when a phone cannot fit it.
+.chart-card.top-card {
+  flex: none;
+  min-height: 0;
+}
+
+.top-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  flex-wrap: wrap;
+}
+
+.top-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+  flex-wrap: wrap;
+  font-weight: normal;
+
+  .knx-seg { height: 30px; }
+}
+
+.top-host {
+  position: relative;
+  display: flex;
+  min-height: 160px;
+  overflow-x: auto;
+}
+
+.top-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-sm);
+  color: var(--ink);
+  transition: opacity var(--t-fast);
+
+  &.is-stale { opacity: .55; }
+
+  th {
+    position: sticky;
+    top: 0;
+    text-align: left;
+    font-size: var(--fs-xs);
+    font-weight: var(--fw-medium);
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    color: var(--ink-3);
+    background: var(--surface-2);
+    border-bottom: 1px solid var(--line);
+    padding: var(--sp-2) var(--sp-3);
+    white-space: nowrap;
+  }
+
+  td {
+    padding: var(--sp-2) var(--sp-3);
+    border-bottom: 1px solid var(--line);
+    white-space: nowrap;
+  }
+
+  tbody tr {
+    cursor: pointer;
+    &:hover { background: var(--surface-2); }
+    &:last-child td { border-bottom: none; }
+  }
+
+  .c-rank { width: 1%; color: var(--ink-3); }
+  .c-num { text-align: right; }
+  th.c-num { text-align: right; }
+  .c-name { color: var(--ink-2); }
+  // Table cells ignore max-width in auto layout, so the ellipsis lives on an inner block.
+  .c-name-text {
+    display: block;
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .c-share { min-width: 150px; }
+  .muted { color: var(--ink-3); }
+}
+
+.top-link {
+  color: var(--brand);
+  text-decoration: none;
+  border-radius: var(--r-sm);
+
+  &:hover { text-decoration: underline; }
+  &:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+}
+
+.share-bar {
+  display: inline-block;
+  vertical-align: middle;
+  width: 64px;
+  height: 6px;
+  margin-right: var(--sp-2);
+  border-radius: var(--r-full);
+  background: var(--surface-3);
+  overflow: hidden;
+
+  > span {
+    display: block;
+    height: 100%;
+    background: var(--brand);
+  }
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .echart {
@@ -284,8 +397,8 @@
       white-space: normal;
     }
 
-    // Label above the input so From and To end up the same width. `min-width: 0` is required —
-    // datetime-local has an intrinsic minimum around 200px that would otherwise burst the grid.
+    // Label above the input so From and To end up the same width. `min-width: 0` keeps the
+    // field's 200px desktop width from bursting the grid.
     .range-field {
       flex-direction: column;
       align-items: stretch;
@@ -299,11 +412,10 @@
         color: var(--ink-3);
       }
 
-      .knx-input {
+      knx-date-time-field {
         width: 100%;
         min-width: 0;
-        height: 44px;
-        font-size: var(--fs-sm);
+        --dtf-height: 44px;
       }
     }
   }
@@ -341,4 +453,46 @@
   }
 
   .heatmap-card { min-height: 260px; }
+}
+
+// Narrow phones: two columns would leave each date-time field under the ~190px it needs for
+// date, time and the calendar button, so From and To stack instead.
+@media (max-width: 479.98px) {
+  .tb-range.is-open { grid-template-columns: 1fr; }
+}
+
+// Phones: the top list keeps address, name, count and share; DPT and rate are the first to go
+// (the DPT is one tap away in the monitor, the rate follows from count and range).
+@media (max-width: 767px) {
+  .top-head { padding: var(--sp-3) var(--sp-4); }
+  .top-controls .knx-seg { height: 36px; }
+
+  .top-table {
+    .c-dpt, .c-rate { display: none; }
+    th, td { padding: var(--sp-2); }
+    .c-name-text { max-width: 34vw; }
+    .c-share { min-width: 0; }
+  }
+
+  .share-bar { display: none; }
+}
+
+// On desktop the message used to stay visually hidden, so a refused "Apply" said nothing.
+// Shown as a small callout under the date fields while it has text.
+@media (min-width: 768px) {
+  .tb-right { position: relative; }
+  .range-hint:not(:empty) {
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 20;
+    width: auto;
+    height: auto;
+    overflow: visible;
+    clip-path: none;
+    padding: 6px 10px;
+    border: 1px solid var(--err);
+    border-radius: var(--r-sm);
+    background: var(--surface);
+    font-size: var(--fs-xs);
+  }
 }

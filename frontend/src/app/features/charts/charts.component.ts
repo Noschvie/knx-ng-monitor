@@ -6,21 +6,29 @@ import { MatSelectModule } from '@angular/material/select';
 import { MatFormFieldModule } from '@angular/material/form-field';
 import { MatMenuModule } from '@angular/material/menu';
 import { MatTooltipModule } from '@angular/material/tooltip';
+import { MatDialog } from '@angular/material/dialog';
 import { ActivatedRoute } from '@angular/router';
 import { NgxEchartsDirective } from 'ngx-echarts';
 import type { ECharts, EChartsCoreOption } from 'echarts/core';
-import { Subscription } from 'rxjs';
+import { Subscription, firstValueFrom } from 'rxjs';
 
 import { ChartsService, ChartSeries, extractNumeric } from '../../core/services/charts.service';
+import { ChartSelectionsService, ChartSelection } from '../../core/services/chart-selections.service';
+import { ConfirmDialogComponent, ConfirmDialogData } from '../../shared/confirm-dialog.component';
 import { ProjectService, GroupAddressDto } from '../../core/services/project.service';
 import { SignalrService, KnxTelegram } from '../../core/services/signalr.service';
 import { LanguageService } from '../../core/i18n/language.service';
 import { localeTag } from '../../core/i18n/locale.util';
 import { TranslatePipe } from '../../core/i18n/translate.pipe';
+import { DateTimeFieldComponent } from '../../shared/date-time-field/date-time-field.component';
 import { ThemeService } from '../../core/services/theme.service';
 import { OverflowTitleDirective } from '../../shared/grid/overflow-title.directive';
-import { RangePreset, resolveRange } from './time-range.util';
-import { readSkin, valueAxis, timeAxis, tooltipCfg, dataZoom, styleLineSeries } from './chart-skin';
+import { SearchCache, foldForSearch, searchTokens } from '../../shared/search.util';
+import { SlashFocusDirective } from '../../shared/slash-focus.directive';
+import { RangePreset, isRangeOrdered, resolveRange } from './time-range.util';
+import { readSkin, valueAxis, timeAxis, tooltipCfg, dataZoom, styleLineSeries, TooltipRow } from './chart-skin';
+import { formatDurationMinutes } from '../../shared/duration.util';
+import { A11yModule } from '@angular/cdk/a11y';
 import {
   ChartDisplayOptions, CurveMode, DEFAULT_CHART_OPTIONS,
   loadChartOptions, saveChartOptions, loadChartQuery, saveChartQuery
@@ -48,39 +56,27 @@ function csvCell(value: string): string {
   return `"${value.replace(/"/g, '""')}"`;
 }
 
-/**
- * Lower-cases and drops diacritics character by character ("Küche" → "kuche"), so a search
- * works without typing umlauts. Deliberately one output character per input character — the
- * highlighting relies on the indices matching the original text.
- */
-function foldForSearch(text: string): string {
-  let out = '';
-  for (const ch of text.toLowerCase()) {
-    const base = ch.normalize('NFD')[0];
-    // Characters outside the BMP would count as two here; keep them as they are.
-    out += ch.length === 1 && base.length === 1 ? base : ch;
-  }
-  return out;
-}
-
-/** Search input split into words, each folded like the text it is matched against. */
-function searchTokens(input: string): string[] {
-  return foldForSearch(input).split(/\s+/).filter((t) => t.length > 0);
-}
-
 interface LiveSeries {
   address: string;
   name: string;
   unit: string;
   isBool: boolean;
   data: [number, number][]; // [epochMs, value]
+  /**
+   * Last reading before the visible window ([epochMs, value]), carried in so the curve starts at
+   * the left edge. Filled from the server's `carry` on load and by points that slide out of the
+   * live window. Display only: never part of `data`, the stats or the CSV.
+   */
+  carry: [number, number] | null;
 }
 
 @Component({
   selector: 'app-charts',
   imports: [
+    A11yModule,
     CommonModule, FormsModule, MatIconModule, MatSelectModule, MatFormFieldModule,
-    MatMenuModule, MatTooltipModule, NgxEchartsDirective, TranslatePipe, OverflowTitleDirective
+    MatMenuModule, MatTooltipModule, NgxEchartsDirective, TranslatePipe, OverflowTitleDirective,
+    DateTimeFieldComponent, SlashFocusDirective
   ],
   templateUrl: './charts.component.html',
   styleUrl: './charts.component.scss'
@@ -93,6 +89,8 @@ export class ChartsComponent implements OnInit, OnDestroy {
   private route = inject(ActivatedRoute);
   private theme = inject(ThemeService);
   private zone = inject(NgZone);
+  private selectionsService = inject(ChartSelectionsService);
+  private dialog = inject(MatDialog);
 
   constructor() {
     // Rebuild with re-read tokens whenever the theme toggles (canvas can't use CSS vars).
@@ -116,7 +114,24 @@ export class ChartsComponent implements OnInit, OnDestroy {
   hasActiveProject = false;
   /** Free-text filter inside the dropdown panel; reset every time it opens. */
   gaFilter = '';
+  /** Folded address + name per GA, built once per GA list instead of on every redraw. */
+  private gaSearchCache = new SearchCache<GroupAddressDto>((ga) => `${ga.address} ${ga.name ?? ''}`);
   @ViewChild('gaSearch') private gaSearch?: ElementRef<HTMLInputElement>;
+  /** Dropdown panel width in px: wider than the 320px trigger so long GA names stay readable,
+   *  but never wider than the viewport minus the page gutters. */
+  gaPanelWidth = ChartsComponent.panelWidthFor(window.innerWidth);
+
+  // --- Saved selections ------------------------------------------------------
+  savedSelections: ChartSelection[] = [];
+  savedOpen = false;
+  savedName = '';
+  savedBusy = false;
+  savedError = false;
+  /** The list request is running; the empty state waits for it. */
+  savedLoading = false;
+  /** At least one list request succeeded, so an empty list really means "none saved". */
+  savedLoaded = false;
+  private missingById = new Map<number, number>();
 
   // --- Time range ------------------------------------------------------------
   preset: RangePreset = '24h';
@@ -126,11 +141,14 @@ export class ChartsComponent implements OnInit, OnDestroy {
 
   /** Mobile only: the range controls are collapsed behind a toolbar toggle. */
   rangeOpen = false;
-  /** Apply was pressed with an incomplete custom range — marks the empty field. */
-  rangeHint = false;
+  /**
+   * Why Apply was refused: an incomplete custom range (marks the empty field) or an end
+   * before the start.
+   */
+  rangeHint: '' | 'missing' | 'order' = '';
   isMobile = window.innerWidth < 768;
-  @ViewChild('fromInput') private fromInput?: ElementRef<HTMLInputElement>;
-  @ViewChild('toInput') private toInput?: ElementRef<HTMLInputElement>;
+  @ViewChild('fromInput') private fromInput?: DateTimeFieldComponent;
+  @ViewChild('toInput') private toInput?: DateTimeFieldComponent;
 
   // --- State -----------------------------------------------------------------
   loading = false;
@@ -148,6 +166,13 @@ export class ChartsComponent implements OnInit, OnDestroy {
 
   /** Span of the loaded range in ms — doubles as the live follow window. */
   private rangeSpanMs = 0;
+  /** Loaded range bounds (epoch ms); pin the x axis so it shows the picked range, not the data extent. */
+  private rangeFromMs = 0;
+  private rangeToMs = 0;
+  /** Set by a load; the next rebuild starts unzoomed instead of keeping the previous zoom. */
+  private freshResult = false;
+  /** Moves the live window forward even while the bus is quiet. */
+  private followTimer?: ReturnType<typeof setInterval>;
 
   private series: LiveSeries[] = [];
   chartOption: EChartsCoreOption = {};
@@ -155,7 +180,7 @@ export class ChartsComponent implements OnInit, OnDestroy {
   // --- Display options -------------------------------------------------------
   options: ChartDisplayOptions = loadChartOptions();
   optionsOpen = false;
-  readonly curveModes: CurveMode[] = ['line', 'area', 'step'];
+  readonly curveModes: CurveMode[] = ['line', 'smooth', 'area', 'step'];
 
   /** Set by ngx-echarts once the canvas exists; needed for the PNG export. */
   private chart?: ECharts;
@@ -170,12 +195,14 @@ export class ChartsComponent implements OnInit, OnDestroy {
   ngOnInit(): void {
     this.preselectGa = this.route.snapshot.queryParamMap.get('ga');
     this.loadGroupAddresses();
+    this.loadSavedSelections();
     this.telegramSub = this.signalr.telegram$.subscribe((t) => this.onLiveTelegram(t));
   }
 
   ngOnDestroy(): void {
     this.telegramSub?.unsubscribe();
     if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.stopFollow();
   }
 
   // --- GA loading ------------------------------------------------------------
@@ -194,6 +221,7 @@ export class ChartsComponent implements OnInit, OnDestroy {
               .filter((ga) => this.isChartable(ga.datapointType))
               .sort((a, b) => a.address.localeCompare(b.address, undefined, { numeric: true }));
             this.displayGas = this.availableGas;
+            this.refreshMissing();
             this.applyPreselect();
           },
           error: () => (this.availableGas = [])
@@ -272,11 +300,7 @@ export class ChartsComponent implements OnInit, OnDestroy {
     const selected = new Set(this.selectedAddresses);
     // Every word has to occur somewhere in address or name, in any order: "küche raum" finds
     // "EG.Küche.Heizung.Raumtemperatur" without typing the path in between.
-    return this.displayGas.filter((ga) => {
-      if (selected.has(ga.address)) return true;
-      const haystack = foldForSearch(`${ga.address} ${ga.name ?? ''}`);
-      return tokens.every((t) => haystack.includes(t));
-    });
+    return this.displayGas.filter((ga) => selected.has(ga.address) || this.gaSearchCache.matches(ga, tokens));
   }
 
   /**
@@ -362,10 +386,127 @@ export class ChartsComponent implements OnInit, OnDestroy {
     this.load();
   }
 
+  // --- Saved selections ------------------------------------------------------
+  private loadSavedSelections(): void {
+    this.savedLoading = true;
+    this.selectionsService.getAll().subscribe({
+      next: (rows) => {
+        this.savedSelections = rows;
+        this.savedLoaded = true;
+        this.savedLoading = false;
+        this.savedError = false;
+        this.refreshMissing();
+      },
+      error: () => {
+        this.savedLoading = false;
+        this.savedError = true;
+      }
+    });
+  }
+
+  /** Counts per selection the addresses the active project does not know. Done once per load
+   *  of either list, not per row on every redraw. */
+  private refreshMissing(): void {
+    const known = new Set(this.availableGas.map((g) => g.address));
+    this.missingById = new Map(
+      this.savedSelections.map((s) => [s.id, s.addresses.filter((a) => !known.has(a)).length])
+    );
+  }
+
+  /** Every address is unknown here (other project, re-import): applying it would only empty
+   *  the chart, so the entry is disabled and its meta line says why. */
+  isUnusable(sel: ChartSelection): boolean {
+    return sel.addresses.length > 0 && this.missingCount(sel) >= sel.addresses.length;
+  }
+
+  /** Same rule as the server: case-insensitive including umlauts ("Übersicht" = "übersicht"). */
+  private sameName(a: string, b: string): boolean {
+    return a.toLowerCase() === b.toLowerCase();
+  }
+
+  toggleSaved(): void {
+    this.savedOpen = !this.savedOpen;
+    if (this.savedOpen) {
+      this.savedError = false;
+      // Picked up again on every open, so a selection saved on another device shows up.
+      this.loadSavedSelections();
+    }
+  }
+
+  /** Applies a saved selection; addresses unknown to the active project are skipped. */
+  applySaved(sel: ChartSelection): void {
+    if (this.isUnusable(sel)) return;
+    const known = new Set(this.availableGas.map((g) => g.address));
+    this.savedOpen = false;
+    this.onSelectionChange(sel.addresses.filter((a) => known.has(a)));
+  }
+
+  /** Addresses of a saved selection that the active project does not know (renamed, other project). */
+  missingCount(sel: ChartSelection): number {
+    return this.missingById.get(sel.id) ?? 0;
+  }
+
+  async saveSelection(): Promise<void> {
+    const name = this.savedName.trim();
+    if (!name || this.selectedAddresses.length === 0 || this.savedBusy) return;
+
+    const existing = this.savedSelections.find((s) => this.sameName(s.name, name));
+    if (existing) {
+      const ok = await this.confirm({
+        title: this.lang.translate('charts.saved.overwriteTitle'),
+        message: this.lang.translate('charts.saved.overwriteMsg', { name: existing.name }),
+        confirmText: this.lang.translate('charts.saved.overwrite')
+      });
+      if (!ok) return;
+    }
+
+    this.savedBusy = true;
+    this.selectionsService.save(name, this.selectedAddresses).subscribe({
+      next: () => {
+        this.savedBusy = false;
+        this.savedName = '';
+        this.loadSavedSelections();
+      },
+      error: () => {
+        this.savedBusy = false;
+        this.savedError = true;
+      }
+    });
+  }
+
+  async deleteSaved(sel: ChartSelection, event: Event): Promise<void> {
+    // The row itself applies the selection; the delete button must not trigger that too.
+    event.stopPropagation();
+    const ok = await this.confirm({
+      title: this.lang.translate('charts.saved.deleteTitle'),
+      message: this.lang.translate('charts.saved.deleteMsg', { name: sel.name }),
+      confirmText: this.lang.translate('common.delete'),
+      danger: true
+    });
+    if (!ok) return;
+
+    const drop = () => (this.savedSelections = this.savedSelections.filter((s) => s.id !== sel.id));
+    this.selectionsService.delete(sel.id).subscribe({
+      next: drop,
+      // Already deleted on another device: the goal is reached, no error to show.
+      error: (err: { status?: number }) => {
+        if (err?.status === 404) drop(); else this.savedError = true;
+      }
+    });
+  }
+
+  private confirm(data: ConfirmDialogData): Promise<boolean | undefined> {
+    return firstValueFrom(
+      this.dialog
+        .open(ConfirmDialogComponent, { data, width: 'min(420px, calc(100vw - 32px))', maxWidth: '100vw' })
+        .afterClosed()
+    );
+  }
+
   // --- Time range ------------------------------------------------------------
   setPreset(p: RangePreset): void {
     // A preset supersedes the custom range, so a pending "pick both dates" hint is stale.
-    this.rangeHint = false;
+    this.rangeHint = '';
     this.preset = p;
     this.load();
   }
@@ -376,11 +517,16 @@ export class ChartsComponent implements OnInit, OnDestroy {
    */
   applyCustom(): void {
     if (!this.customFrom || !this.customTo) {
-      this.rangeHint = true;
-      (this.customFrom ? this.toInput : this.fromInput)?.nativeElement.focus();
+      this.rangeHint = 'missing';
+      (this.customFrom ? this.toInput : this.fromInput)?.focus();
       return;
     }
-    this.rangeHint = false;
+    if (!isRangeOrdered(this.customFrom, this.customTo)) {
+      this.rangeHint = 'order';
+      this.toInput?.focus();
+      return;
+    }
+    this.rangeHint = '';
     this.preset = 'custom';
     this.load();
   }
@@ -388,17 +534,94 @@ export class ChartsComponent implements OnInit, OnDestroy {
   /** Chart paddings differ per breakpoint; the canvas size itself is handled by [autoResize]. */
   @HostListener('window:resize')
   onResize(): void {
+    this.gaPanelWidth = ChartsComponent.panelWidthFor(window.innerWidth);
     const mobile = window.innerWidth < 768;
     if (mobile === this.isMobile) return;
     this.isMobile = mobile;
     if (this.series.length) this.rebuildChart();
   }
 
+  /** At least the 320px trigger, but below 352px the viewport wins so the list never overflows. */
+  private static panelWidthFor(viewport: number): number {
+    return Math.min(Math.max(320, Math.min(640, viewport - 32)), viewport - 32);
+  }
+
   toggleLive(): void {
+    // A custom range never runs live (see onLiveTelegram); the button only explains that.
+    if (this.preset === 'custom') return;
+    if (this.following) {
+      // Switching live off keeps the window that is on screen now. Falling back to the range of
+      // the last load would push the newest minutes out on the right.
+      const { xMin, xMax } = this.xWindow();
+      if (xMin !== undefined && xMax !== undefined) {
+        this.rangeFromMs = xMin;
+        this.rangeToMs = xMax;
+      }
+    }
     this.liveAppend = !this.liveAppend;
+    if (this.liveAppend) {
+      // Telegrams that arrived while live was off were not kept, so the series would extend a
+      // stale last value flat up to now. Reload the preset window instead.
+      this.load();
+      return;
+    }
+    this.syncFollow();
     // Animation is disabled while live so appended points don't re-animate the whole
     // curve every flush; rebuild so the change takes effect immediately.
     this.rebuildChart();
+  }
+
+  /**
+   * Live on a relative preset: the x axis always ends at "now" and starts one preset span
+   * earlier, so the window keeps moving when no telegram arrives. A custom range is a fixed
+   * window and never follows.
+   */
+  private get following(): boolean {
+    return this.liveAppend && this.preset !== 'custom' && this.rangeSpanMs > 0;
+  }
+
+  /** (Re)starts or stops the follow tick to match the current live/preset state. */
+  private syncFollow(): void {
+    this.stopFollow();
+    if (!this.following) return;
+    // About one pixel of a ~1800px wide chart per tick, clamped to 1 s to 60 s: 1h moves every
+    // 2 s, 24h every 48 s, 7d/30d once a minute. More often would just redraw the same picture.
+    const tickMs = Math.min(60_000, Math.max(1_000, Math.round(this.rangeSpanMs / 1800)));
+    this.followTimer = setInterval(() => this.followTick(), tickMs);
+  }
+
+  private stopFollow(): void {
+    if (this.followTimer) clearInterval(this.followTimer);
+    this.followTimer = undefined;
+  }
+
+  /** Drops points that slid out of the live window on the left; true when any did. */
+  private trimToWindow(now: number): boolean {
+    const cutoff = now - this.rangeSpanMs;
+    let dropped = false;
+    for (const s of this.series) {
+      const before = s.data.length;
+      this.dropBefore(s, cutoff);
+      dropped ||= s.data.length !== before;
+    }
+    return dropped;
+  }
+
+  /**
+   * Removes the points older than `cutoff` (or, with `keep`, all but the newest `keep` points)
+   * and keeps the newest removed one as the carry-in value, so the curve still starts at the
+   * left edge with the value that was in force there.
+   */
+  private dropBefore(s: LiveSeries, cutoff: number, keep?: number): void {
+    let drop = 0;
+    if (keep !== undefined) {
+      drop = Math.max(0, s.data.length - keep);
+    } else {
+      while (drop < s.data.length && s.data[drop][0] < cutoff) drop++;
+    }
+    if (drop === 0) return;
+    s.carry = s.data[drop - 1];
+    s.data.splice(0, drop);
   }
 
   // --- Display options -------------------------------------------------------
@@ -528,6 +751,7 @@ export class ChartsComponent implements OnInit, OnDestroy {
     });
 
     if (this.selectedAddresses.length === 0) {
+      this.stopFollow();
       this.series = [];
       this.chartOption = {};
       this.resetResultState();
@@ -536,41 +760,60 @@ export class ChartsComponent implements OnInit, OnDestroy {
     const range = resolveRange(this.preset, this.customFrom, this.customTo);
     if (!range) return;
 
-    this.rangeSpanMs = new Date(range.to).getTime() - new Date(range.from).getTime();
+    this.rangeFromMs = new Date(range.from).getTime();
+    this.rangeToMs = new Date(range.to).getTime();
+    this.rangeSpanMs = this.rangeToMs - this.rangeFromMs;
+    // Restarted once the data is in; ticking meanwhile would trim the curve of the old result.
+    this.stopFollow();
 
     this.loading = true;
     this.error = false;
+    // Quick preset switches overlap requests; only the newest may land, an older 24 h answer
+    // arriving late would otherwise replace the 1 h curve while rangeSpanMs is already 1 h.
+    const seq = ++this.loadSeq;
     this.chartsService.getSeries(this.selectedAddresses, range.from, range.to, 2000).subscribe({
       next: (res) => {
+        if (seq !== this.loadSeq) return;
         this.downSampled = res.series.some((s) => s.downSampled);
         this.truncated = res.truncated;
         this.totalPoints = res.series.reduce((sum, s) => sum + s.totalPoints, 0);
         this.shownPoints = res.series.reduce((sum, s) => sum + s.points.length, 0);
         this.series = res.series.map((s) => this.toLiveSeries(s));
-        this.rebuildChart();
+        this.freshResult = true;
         this.loading = false;
+        this.rebuildChart();
+        this.syncFollow();
       },
       error: () => {
+        if (seq !== this.loadSeq) return;
         this.loading = false;
         this.error = true;
       }
     });
   }
 
+  private loadSeq = 0;
+
   private toLiveSeries(s: ChartSeries): LiveSeries {
     const ga = this.availableGas.find((g) => g.address === s.address);
+    const isBool = this.isBoolDpt(ga?.datapointType);
     return {
       address: s.address,
       name: s.name || ga?.name || s.address,
-      unit: s.unit,
-      isBool: this.isBoolDpt(ga?.datapointType),
-      data: s.points.map((p) => [new Date(p.t).getTime(), p.v] as [number, number])
+      // For DPT1 the backend's "unit" is the label of the first value ("On", "Inactive"), not a
+      // unit; kept, it ended up behind every number ("0.13 Inactive" as the average).
+      unit: isBool ? '' : s.unit,
+      isBool,
+      data: s.points.map((p) => [new Date(p.t).getTime(), p.v] as [number, number]),
+      carry: s.carry ? [new Date(s.carry.t).getTime(), s.carry.v] : null
     };
   }
 
   // --- Live append -----------------------------------------------------------
   private onLiveTelegram(t: KnxTelegram): void {
-    if (!this.liveAppend) return;
+    // A custom range is a fixed window: an appended reading would lie past its end and trim the
+    // curve from the left.
+    if (!this.liveAppend || this.preset === 'custom') return;
     const s = this.series.find((x) => x.address === t.destinationAddress);
     if (!s) return;
     const v = extractNumeric(t.valueDecoded);
@@ -580,16 +823,8 @@ export class ChartsComponent implements OnInit, OnDestroy {
 
     // Live means a window that moves with the data, not a range that grows without end. Trimming
     // the data (rather than pinning the axis) keeps the user's dataZoom selection working.
-    if (this.rangeSpanMs > 0) {
-      const cutoff = ts - this.rangeSpanMs;
-      let drop = 0;
-      while (drop < s.data.length && s.data[drop][0] < cutoff) drop++;
-      if (drop > 0) s.data.splice(0, drop);
-    }
-
-    if (s.data.length > this.maxLivePoints) {
-      s.data.splice(0, s.data.length - this.maxLivePoints);
-    }
+    if (this.rangeSpanMs > 0) this.dropBefore(s, ts - this.rangeSpanMs);
+    if (s.data.length > this.maxLivePoints) this.dropBefore(s, 0, this.maxLivePoints);
     this.scheduleFlush();
   }
 
@@ -623,64 +858,102 @@ export class ChartsComponent implements OnInit, OnDestroy {
       return;
     }
 
-    // One Y axis per distinct unit (max 3); extra units share the last axis.
-    const units: string[] = [];
+    // One Y axis per distinct unit, so no series is ever drawn in another unit's scale (#35).
+    // Only the first few get labels and space; the rest are invisible but still scale their own
+    // series, and tooltip and table give the exact values. All DPT1 series
+    // share one fixed 0..1 axis instead: their "unit" from the backend is just the label of the
+    // first value ("On", "False", "Start"), so grouping by it gave two switches two axes, and a
+    // switch that stayed on for the whole range got an auto-scaled 0.5..1.5 axis; its 1 then sat
+    // halfway up next to another switch's 1 at the top.
+    const BOOL_AXIS = '\u0000bool';
+    const axisKey = (s: LiveSeries) => (s.isBool ? BOOL_AXIS : s.unit);
+    const keys: string[] = [];
     for (const s of this.series) {
-      if (!units.includes(s.unit)) units.push(s.unit);
+      const k = axisKey(s);
+      if (!keys.includes(k)) keys.push(k);
     }
-    const axisUnits = units.slice(0, 3);
-    const unitToAxis = new Map<string, number>();
-    units.forEach((u, i) => unitToAxis.set(u, Math.min(i, axisUnits.length - 1)));
+    const keyToAxis = new Map(keys.map((k, i) => [k, i]));
+    // Desktop fits a left axis and two on the right; a phone only one on each side.
+    const shownAxes = Math.min(keys.length, this.isMobile ? 2 : 3);
 
     const skin = readSkin();
     const singleSeries = this.series.length === 1;
     const opts = this.options;
 
-    const yAxis = axisUnits.map((u, i) => valueAxis(skin, {
-      name: u || undefined,
+    const yAxis = keys.map((k, i) => valueAxis(skin, {
+      show: i < shownAxes,
       position: i === 0 ? 'left' : 'right',
       offset: i >= 2 ? 60 : 0,
       splitLine: { show: i === 0, lineStyle: { color: skin.line } },
-      // Pull zero into view without clipping negative readings (outdoor temperatures).
-      ...(opts.zeroBased ? { min: (v: { min: number }) => Math.min(0, v.min) } : {})
+      ...(k === BOOL_AXIS
+        ? { scale: false, min: 0, max: 1, interval: 1 }
+        : {
+            name: k || undefined,
+            // Pull zero into view without clipping negative readings (outdoor temperatures).
+            ...(opts.zeroBased ? { min: (v: { min: number }) => Math.min(0, v.min) } : {})
+          })
     }));
+
+    const following = this.following;
+    const { now, xMin, xMax } = this.xWindow();
 
     const echartsSeries = this.series.map((s, i) => {
       const color = skin.palette[i % skin.palette.length];
       // 'line' keeps the long-standing behaviour of filling a lone numeric series;
       // 'area' forces the fill for every series, 'step' never fills.
       const withArea = opts.curve === 'area'
-        || (opts.curve === 'line' && singleSeries && !s.isBool);
+        || ((opts.curve === 'line' || opts.curve === 'smooth') && singleSeries && !s.isBool);
       // Booleans are always stepped — interpolating between on and off is a lie.
       const stepped = opts.curve === 'step' || s.isBool;
 
       return styleLineSeries({
         name: s.name,
         type: 'line' as const,
-        yAxisIndex: unitToAxis.get(s.unit) ?? 0,
+        yAxisIndex: keyToAxis.get(axisKey(s)) ?? 0,
         showSymbol: opts.showPoints,
         symbolSize: 4,
         step: stepped ? ('end' as const) : undefined,
+        // 'x'-monotone smoothing never bends back in time or overshoots between two readings,
+        // so a rounded curve does not invent peaks the sensor never reported.
+        ...(opts.curve === 'smooth' && !stepped ? { smooth: 0.4, smoothMonotone: 'x' as const } : {}),
         // Thins out dense series for drawing without distorting the curve shape.
         sampling: 'lttb',
-        ...(opts.averageLine
+        // The line sits on the table's mean rather than ECharts' own 'average': that one would
+        // also count the display-only point at "now" and drift away from the table.
+        ...(opts.averageLine && this.seriesAvg(s) !== null
           ? {
               markLine: {
                 silent: true,
                 symbol: 'none',
-                data: [{ type: 'average' as const }],
+                data: [{ yAxis: this.seriesAvg(s)! }],
                 lineStyle: { color, type: 'dashed' as const, width: 1 },
                 label: { color: skin.ink2, fontSize: 10, formatter: '⌀ {c}' }
               }
             }
           : {}),
-        data: s.data
+        data: this.displayData(s, xMin, following ? now : undefined)
       }, color, withArea);
     });
 
     this.stats = this.series
-      .filter((s) => s.data.length > 0)
-      .map((s, i) => {
+      .filter((s) => s.data.length > 0 || s.carry)
+      .map((s) => {
+        // No reading inside the range, only the value carried in from before: that value held
+        // the whole time, so it is min, max, average and last alike, with 0 points.
+        if (s.data.length === 0) {
+          const v = s.carry![1];
+          return {
+            name: s.name,
+            address: s.address,
+            unit: s.unit,
+            color: skin.palette[this.series.indexOf(s) % skin.palette.length],
+            min: v,
+            max: v,
+            avg: v,
+            last: v,
+            count: 0
+          };
+        }
         let min = s.data[0][1];
         let max = min;
         let sum = 0;
@@ -708,7 +981,7 @@ export class ChartsComponent implements OnInit, OnDestroy {
     this.chartOption = {
       // Re-animating every curve on each live flush is distracting and costly.
       animation: !this.liveAppend,
-      tooltip: tooltipCfg(skin, unitByName, localeTag(this.lang.lang())),
+      tooltip: tooltipCfg(skin, unitByName, localeTag(this.lang.lang()), (t) => this.tooltipRows(t, skin.palette)),
       legend: {
         // Kept in the option even when hidden: it carries the show/hide state that the
         // summary table drives.
@@ -721,20 +994,149 @@ export class ChartsComponent implements OnInit, OnDestroy {
       },
       // Tighter margins on mobile so axes, legend and the dataZoom slider still fit the 46vh box.
       grid: this.isMobile
-        ? { left: 42, right: axisUnits.length > 1 ? 46 : 10, top: opts.showLegend ? 34 : 20, bottom: 84 }
-        : { left: 56, right: axisUnits.length > 1 ? 72 : 24, top: opts.showLegend ? 40 : 16, bottom: 92 },
-      xAxis: timeAxis(skin, localeTag(this.lang.lang())),
+        // The right margin grows with the axes drawn there; the third one sits 60px further out.
+        ? { left: 42, right: shownAxes > 1 ? 46 : 10, top: opts.showLegend ? 34 : 20, bottom: 84 }
+        : { left: 56, right: shownAxes > 2 ? 132 : shownAxes > 1 ? 72 : 24, top: opts.showLegend ? 40 : 16, bottom: 92 },
+      xAxis: { ...timeAxis(skin, localeTag(this.lang.lang())), min: xMin, max: xMax },
       yAxis,
-      dataZoom: dataZoom(skin, this.isMobile),
+      dataZoom: this.keepZoom(dataZoom(skin, this.isMobile)),
       series: echartsSeries
     };
   }
 
+  /**
+   * ngx-echarts replaces the whole option on every rebuild (live flush, theme, options), which
+   * would throw away a zoom the user set with the slider. Carry the current window over.
+   */
+  private keepZoom(zooms: Array<Record<string, unknown>>): Array<Record<string, unknown>> {
+    const current = (this.chart?.getOption() as { dataZoom?: { start?: number; end?: number }[] } | undefined)
+      ?.dataZoom?.[0];
+    // A fresh result starts unzoomed; the old window would cut into the new range.
+    if (this.freshResult) {
+      this.freshResult = false;
+      return zooms;
+    }
+    if (!current || current.start == null || current.end == null) return zooms;
+    if (current.start <= 0 && current.end >= 100) return zooms;
+    return zooms.map((z) => ({ ...z, start: current.start, end: current.end }));
+  }
+
+  /**
+   * Visible x window: live follows "now", otherwise the axis spans exactly the loaded range.
+   * Pinning both ends (instead of letting ECharts fit the data) keeps the chosen period visible
+   * even when the readings only cover part of it.
+   */
+  private xWindow(): { now: number; xMin?: number; xMax?: number } {
+    // A server clock slightly ahead of the browser would otherwise push the newest reading past
+    // the right edge, exactly the point live mode is about.
+    const newest = Math.max(0, ...this.series.map((s) => s.data[s.data.length - 1]?.[0] ?? 0));
+    const now = Math.max(Date.now(), newest);
+    return this.following
+      ? { now, xMin: now - this.rangeSpanMs, xMax: now }
+      : { now, xMin: this.rangeFromMs || undefined, xMax: this.rangeToMs || undefined };
+  }
+
+  /**
+   * One follow tick. Only the x window and the series data change, so they are merged into the
+   * running chart instead of rebuilding the option: a rebuild would also reset the zoom.
+   */
+  private followTick(): void {
+    if (!this.following || this.series.length === 0 || this.loading || document.hidden) return;
+    // Points falling out on the left change min, max, average and the mean line: rebuild then
+    // (rebuildChart keeps the zoom); otherwise only the window moves and a merge is enough.
+    if (this.trimToWindow(Date.now()) || !this.chart) {
+      this.rebuildChart();
+      return;
+    }
+    const { now, xMin, xMax } = this.xWindow();
+    this.chart.setOption({
+      xAxis: { min: xMin, max: xMax },
+      series: this.series.map((s) => ({ data: this.displayData(s, xMin, now) }))
+    });
+  }
+
+  /** A tab in the background skips its ticks; catch up at once when it comes back. */
+  @HostListener('document:visibilitychange')
+  onVisibilityChange(): void {
+    if (!document.hidden) this.followTick();
+  }
+
+  /** Mean of the readings in range, the same number the summary table shows. Only a carried-in
+   *  value and no reading: that value held the whole time. */
+  private seriesAvg(s: LiveSeries): number | null {
+    if (s.data.length === 0) return s.carry ? s.carry[1] : null;
+    let sum = 0;
+    for (const [, v] of s.data) sum += v;
+    return sum / s.data.length;
+  }
+
+  /**
+   * A KNX value holds until the next telegram, so the curve is drawn across the whole window:
+   * from the left edge with the value carried in from before it (when there is one), and in
+   * live mode on to "now" with the last value. Both extra points are display only: they never
+   * enter the stats or the CSV, and they get no symbol so they are not mistaken for readings.
+   */
+  private displayData(s: LiveSeries, start: number | undefined, now: number | undefined): unknown[] {
+    const out: unknown[] = [];
+    const first = s.data[0];
+    if (s.carry && start !== undefined && (!first || first[0] > start)) {
+      out.push({ value: [start, s.carry[1]], symbol: 'none' });
+      // The carried value held until the first reading, so hold it flat up to there and let the
+      // curve jump; a line or smooth curve would otherwise draw a ramp over the whole gap.
+      if (first && first[1] !== s.carry[1]) {
+        out.push({ value: [first[0], s.carry[1]], symbol: 'none' });
+      }
+    }
+    out.push(...s.data);
+
+    const last = s.data[s.data.length - 1] ?? (s.carry ? [start ?? s.carry[0], s.carry[1]] : undefined);
+    if (now !== undefined && last && last[0] < now) {
+      out.push({ value: [now, last[1]], symbol: 'none' });
+    }
+    return out;
+  }
+
+  /**
+   * Tooltip rows for the time under the pointer: every visible series with the value in force
+   * then, i.e. its last reading at or before that time (a KNX value holds until the next
+   * telegram), or the carried-in value before the first one. The age tells a fresh reading from
+   * a held one. Series without any value yet at that time are left out.
+   */
+  private tooltipRows(time: number, palette: string[]): TooltipRow[] {
+    const rows: TooltipRow[] = [];
+    this.series.forEach((s, i) => {
+      if (this.hiddenSeries.has(s.name)) return;
+      // Last index with timestamp <= time (binary search; data is in time order).
+      let lo = 0;
+      let hi = s.data.length - 1;
+      let at = -1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (s.data[mid][0] <= time) { at = mid; lo = mid + 1; } else hi = mid - 1;
+      }
+      const point = at >= 0 ? s.data[at] : s.carry;
+      if (!point || point[0] > time) return;
+      const ageMs = time - point[0];
+      rows.push({
+        name: s.name,
+        color: palette[i % palette.length],
+        value: point[1],
+        unit: s.unit,
+        // Under a second it is the reading itself; no age needed.
+        age: ageMs >= 1000
+          ? this.lang.translate('charts.tooltipAge', { age: formatDurationMinutes(ageMs / 60_000) })
+          : undefined
+      });
+    });
+    return rows;
+  }
+
   get hasData(): boolean {
-    return this.series.some((s) => s.data.length > 0);
+    return this.series.some((s) => s.data.length > 0 || s.carry);
   }
 
   liveTooltip(): string {
+    if (this.preset === 'custom') return this.lang.translate('charts.liveCustom');
     return this.lang.translate(this.liveAppend ? 'charts.liveOn' : 'charts.liveOff');
   }
 }

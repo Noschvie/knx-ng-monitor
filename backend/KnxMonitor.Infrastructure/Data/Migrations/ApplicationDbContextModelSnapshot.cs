@@ -15,7 +15,38 @@ namespace KnxMonitor.Infrastructure.Data.Migrations
         protected override void BuildModel(ModelBuilder modelBuilder)
         {
 #pragma warning disable 612, 618
-            modelBuilder.HasAnnotation("ProductVersion", "9.0.10");
+            modelBuilder.HasAnnotation("ProductVersion", "10.0.12");
+
+            modelBuilder.Entity("KnxMonitor.Core.Entities.ChartSelection", b =>
+                {
+                    b.Property<int>("Id")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER");
+
+                    b.Property<string>("Addresses")
+                        .IsRequired()
+                        .HasMaxLength(400)
+                        .HasColumnType("TEXT");
+
+                    b.Property<DateTime>("CreatedAt")
+                        .HasColumnType("TEXT");
+
+                    b.Property<string>("Name")
+                        .IsRequired()
+                        .HasMaxLength(100)
+                        .HasColumnType("TEXT")
+                        .UseCollation("NOCASE");
+
+                    b.Property<DateTime>("UpdatedAt")
+                        .HasColumnType("TEXT");
+
+                    b.HasKey("Id");
+
+                    b.HasIndex("Name")
+                        .IsUnique();
+
+                    b.ToTable("ChartSelections");
+                });
 
             modelBuilder.Entity("KnxMonitor.Core.Entities.CommunicationObject", b =>
                 {
@@ -122,6 +153,9 @@ namespace KnxMonitor.Infrastructure.Data.Migrations
                         .HasMaxLength(500)
                         .HasColumnType("TEXT");
 
+                    b.Property<string>("Functions")
+                        .HasColumnType("TEXT");
+
                     b.Property<string>("Name")
                         .IsRequired()
                         .HasMaxLength(200)
@@ -186,7 +220,7 @@ namespace KnxMonitor.Infrastructure.Data.Migrations
 
                     b.Property<string>("IpAddress")
                         .IsRequired()
-                        .HasMaxLength(50)
+                        .HasMaxLength(253)
                         .HasColumnType("TEXT");
 
                     b.Property<bool>("IsActive")
@@ -199,6 +233,22 @@ namespace KnxMonitor.Infrastructure.Data.Migrations
 
                     b.Property<int>("Port")
                         .HasColumnType("INTEGER");
+
+                    b.Property<string>("TunnelAddress")
+                        .HasMaxLength(20)
+                        .HasColumnType("TEXT");
+
+                    b.Property<bool>("TunnelAddressFallback")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER")
+                        .HasDefaultValue(true);
+
+                    b.Property<string>("TunnelProtocol")
+                        .IsRequired()
+                        .ValueGeneratedOnAdd()
+                        .HasMaxLength(10)
+                        .HasColumnType("TEXT")
+                        .HasDefaultValue("Udp");
 
                     b.Property<DateTime>("UpdatedAt")
                         .HasColumnType("TEXT");
@@ -257,7 +307,7 @@ namespace KnxMonitor.Infrastructure.Data.Migrations
 
                     b.HasIndex("GroupAddressId");
 
-                    b.HasIndex("Timestamp", "DestinationAddress");
+                    b.HasIndex("Timestamp", "DestinationAddress", "SourceAddress");
 
                     b.ToTable("KnxTelegrams");
                 });
@@ -433,6 +483,11 @@ namespace KnxMonitor.Infrastructure.Data.Migrations
 
                     b.Property<int?>("ArchiveRetentionDays")
                         .HasColumnType("INTEGER");
+
+                    b.Property<int>("HistoryWriteIntervalSeconds")
+                        .ValueGeneratedOnAdd()
+                        .HasColumnType("INTEGER")
+                        .HasDefaultValue(0);
 
                     b.Property<int>("HotBufferMaxCount")
                         .HasColumnType("INTEGER");
