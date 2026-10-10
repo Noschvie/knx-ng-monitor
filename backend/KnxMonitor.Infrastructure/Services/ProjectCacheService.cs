@@ -18,12 +18,31 @@ namespace KnxMonitor.Infrastructure.Services;
 public interface IProjectCacheService
 {
     Task InitializeAsync();
-    Task RefreshAsync();
+
+    /// <summary>Reloads the cache from the active project.</summary>
+    /// <param name="force">
+    /// Reload even when the active project id has not changed. Needed after a re-import: the row
+    /// keeps its id, so the cheap id comparison would keep the stale group addresses alive and
+    /// incoming telegrams would decode against the pre-import DPTs.
+    /// </param>
+    Task RefreshAsync(bool force = false);
     GroupAddress? GetByAddress(string address);
     Task<GroupAddress?> GetByAddressAsync(string address);
 
     /// <summary>Device of the active project by individual address ("1.1.5"), or null.</summary>
     Device? GetDeviceByAddress(string physicalAddress);
+
+    /// <summary>
+    /// Where the device with this individual address sits in the active project's building
+    /// (compact label and full path, see <see cref="BuildingPartResolver"/>), or null.
+    /// </summary>
+    BuildingPart? GetBuildingPart(string physicalAddress);
+
+    /// <summary>
+    /// Names of the ETS functions the group address belongs to in the active project; empty when
+    /// it is in none or unknown.
+    /// </summary>
+    IReadOnlyList<string> GetFunctions(string groupAddress);
 }
 
 public class ProjectCacheService : IProjectCacheService
@@ -32,6 +51,9 @@ public class ProjectCacheService : IProjectCacheService
     private readonly IServiceScopeFactory _scopeFactory;
     private readonly ConcurrentDictionary<string, GroupAddress> _addressCache = new();
     private readonly ConcurrentDictionary<string, Device> _deviceCache = new();
+    // Derived from the same project load as the two above, so they share their lifetime.
+    private readonly ConcurrentDictionary<string, BuildingPart> _buildingPartCache = new();
+    private readonly ConcurrentDictionary<string, string[]> _functionCache = new();
     private int? _currentActiveProjectId;
 
     public ProjectCacheService(
@@ -47,7 +69,7 @@ public class ProjectCacheService : IProjectCacheService
         await RefreshAsync();
     }
 
-    public async Task RefreshAsync()
+    public async Task RefreshAsync(bool force = false)
     {
         try
         {
@@ -63,12 +85,15 @@ public class ProjectCacheService : IProjectCacheService
                 _logger.LogInformation("No active project found, clearing cache");
                 _addressCache.Clear();
                 _deviceCache.Clear();
+                _buildingPartCache.Clear();
+                _functionCache.Clear();
                 _currentActiveProjectId = null;
                 return;
             }
 
-            // Check if we need to refresh (different project)
-            if (_currentActiveProjectId == activeProject.Id && _addressCache.Any())
+            // Check if we need to refresh (different project). A re-import keeps the id but
+            // rewrites names and DPTs, so it has to pass force: true to get past this.
+            if (!force && _currentActiveProjectId == activeProject.Id && _addressCache.Any())
             {
                 _logger.LogDebug("Cache already up-to-date for project {ProjectId}", activeProject.Id);
                 return;
@@ -81,9 +106,14 @@ public class ProjectCacheService : IProjectCacheService
             var groupAddresses = await groupAddressRepository.GetByProjectIdAsync(activeProject.Id);
 
             _addressCache.Clear();
+            _functionCache.Clear();
             foreach (var ga in groupAddresses)
             {
                 _addressCache[ga.Address] = ga;
+                if (!string.IsNullOrEmpty(ga.Functions))
+                {
+                    _functionCache[ga.Address] = ga.Functions.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                }
             }
 
             var devices = await projectRepository.GetDevicesAsync(activeProject.Id);
@@ -95,6 +125,14 @@ public class ProjectCacheService : IProjectCacheService
                 {
                     _deviceCache[device.PhysicalAddress] = device;
                 }
+            }
+
+            var locations = await projectRepository.GetLocationsAsync(activeProject.Id);
+
+            _buildingPartCache.Clear();
+            foreach (var (address, part) in BuildingPartResolver.ForDevices(locations))
+            {
+                _buildingPartCache[address] = part;
             }
 
             _currentActiveProjectId = activeProject.Id;
@@ -127,5 +165,21 @@ public class ProjectCacheService : IProjectCacheService
             return null;
 
         return _deviceCache.TryGetValue(physicalAddress, out var device) ? device : null;
+    }
+
+    public BuildingPart? GetBuildingPart(string physicalAddress)
+    {
+        if (string.IsNullOrWhiteSpace(physicalAddress))
+            return null;
+
+        return _buildingPartCache.TryGetValue(physicalAddress, out var part) ? part : null;
+    }
+
+    public IReadOnlyList<string> GetFunctions(string groupAddress)
+    {
+        if (string.IsNullOrWhiteSpace(groupAddress))
+            return Array.Empty<string>();
+
+        return _functionCache.TryGetValue(groupAddress, out var names) ? names : Array.Empty<string>();
     }
 }

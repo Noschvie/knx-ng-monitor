@@ -10,6 +10,146 @@ Docker images are published per tag to
 binaries and auto-generated notes are on the
 [GitHub Releases](https://github.com/ingel81/knx-ng-monitor/releases) page.
 
+## [0.13.1]
+
+The `v0.13.0` tag was never published: the release pipeline stopped at an outdated
+Docker smoke test (it still expected the image to start as uid 1000, see #40). 0.13.1 is
+the same release with that test fixed.
+
+### Added
+- **A tunnel that survives a bad network link (#22, #20).** The tunnel used to be torn down
+  at the first hiccup and only rebuilt by the 10 s auto-connect poll, so every short dropout
+  on a WLAN path turned into a gap of up to half a minute, and every reconnect occupied a
+  fresh tunnel slot until the interface ran out of them. Falcon's `AutoReconnect` is now on
+  for every tunnel (the link shows as connecting while it recovers), a lost link triggers the
+  reconnect immediately with a 1/2/4/8 s backoff for failed attempts, and the transport is
+  selectable: **UDP** (default) or **TCP**, which copes far better with lossy links.
+- **Requested tunnel address (#10).** Tunneling can ask the interface for a fixed individual
+  address instead of whatever slot is free, so reconnects stop wandering through the tunnel
+  pool. When the address is taken, or outside the pool, the monitor falls back to any free
+  slot instead of failing (can be switched off). Verified against an MDT IP router over UDP
+  and TCP.
+- **Host names for tunneling (#23).** The interface address accepts a DNS name in tunneling
+  mode; routing stays numeric, since that field is a multicast group. The existing IP Secure
+  tunnel flag finally has a switch in Settings as well.
+- **Buffered history writes to spare SD cards (#37).** New setting "Write history":
+  immediately (default) or collected every 5 s up to 10 min. Collected telegrams go to the
+  database in one transaction per interval, retention and the WAL checkpoint run once per
+  flush, and the NDJSON archive syncs on the same rhythm. The live view is not delayed. A
+  power cut loses what is still buffered, which is why immediate stays the default; the
+  heartbeats are written in the same flush, so such a gap shows up in the availability report.
+- **Top group addresses and senders (#38).** A new statistics card lists, for the selected
+  range, the busiest group addresses (name, DPT, count, share, telegrams per hour) and the
+  busiest sending devices with their names from the project, top 10 / 20 / 50. A click opens
+  the monitor archive filtered to that address or device over the same range; the monitor
+  now understands `?mode=archive&address=&source=&from=&to=` for that. New endpoint:
+  `GET /api/telegrams/top`.
+- **Charts:** every unit gets its own y axis (#35), the tooltip lists every series at the
+  hovered time with the value in force and its age (#36), group-address selections can be
+  saved and recalled across devices (#32), the live window keeps moving with the current
+  time (#27), the value in force before the range is carried in so a rarely sending address
+  no longer starts blank, and an optional smoothed curve (#33). Switching values (DPT 1)
+  share one 0..1 axis (#30). Contributions by Elkomaster91, thank you.
+- **Graph filters (#17):** the GA network graph filters by main / middle group, room or
+  building part, DPT / type and free text (word-based, umlauts optional), plus a neighbourhood
+  of 1 to 3 levels around the matches. Filters combine, survive a page reload and reset with
+  one click; on phones the bar sits behind a button.
+- **Building part and function columns (#12).** Two opt-in monitor columns: the building
+  part of the sending device (compact path, only levels with siblings, the full path in the
+  tooltip) and the ETS functions of the destination address ("Name +N" with the list in the
+  tooltip). ETS 5/6 functions are parsed now; existing projects show them after a re-import.
+  Both columns are in the live view, the archive, both CSV exports and the telegram details.
+- **Docker: PUID / PGID (#40).** The container starts as root, hands `/app/data` to
+  `PUID:PGID` (default `1000:1000`) and runs the application as that user. A bind mount that
+  Docker created as root, or one owned by another NAS user, no longer needs a manual `chown`.
+  Started with `--user` and an unwritable data directory, the container stops with a clear
+  message instead of serving an empty login page; the binary fails fast the same way.
+- **The version is shown in the user menu.**
+
+### Changed
+- **Statistics are counted in the database (#39).** The histogram and the heatmap used to
+  stream every single timestamp of the range into .NET and count there, twice per page
+  load. They now come from index range counts in SQLite: on a real database with one million
+  telegrams a 30-day range drops from about 400 ms to about 55 ms per query (desktop), with
+  identical numbers, which tests comparing the old and the new counting make sure of.
+- **In-app date and time field (#15, #41).** Charts, statistics and the archive filter no
+  longer use the browser's `datetime-local` input, which accepted six-digit years such as
+  "08.10.202600". The new field has a calendar, a 24-hour time list, a mandatory four-digit
+  year, flags invalid input and an end before the start, and opens as a dialog on phones.
+- **Dates follow the browser locale (#42).** Formatting used the UI language (de-DE or
+  en-GB); it now takes the browser's regional setting, so an English UI in a de-AT browser
+  shows 24.09.2026 and an en-US browser 09/24/2026. Time stays 24-hour everywhere.
+- **Word-based search everywhere (#31, #34).** The monitor, group-address and log searches
+  match words in any order, umlauts optional, like the chart GA picker; `/` focuses the
+  search field of the current page.
+- **The weekday heatmap starts on Monday in German (#25)**, English keeps Sunday.
+- **Clearing the history is reachable from live mode**, and "Clear" became "Clear view" so
+  it no longer reads like deleting the database.
+- **.NET 10 LTS (#16)** for backend, Docker image and release binaries. The OpenAPI document
+  picks up the XML doc comments natively now.
+- **A project import parses `0.xml` once** instead of up to three times.
+- The telegram index now covers `(Timestamp, DestinationAddress, SourceAddress)`, so the new
+  top-sender query is index-only as well. The upgrade rebuilds it once (a few seconds per
+  million telegrams).
+
+### Fixed
+- **A re-import kept decoding with the old datapoint types (#24).** It keeps the project id,
+  so the group-address cache skipped its reload; only deleting and importing anew helped.
+- **The last batch of telegrams could be lost on a normal stop**: shutdown now drains and
+  writes the queue instead of cancelling it.
+- **Project names could inject HTML into chart tooltips and graph labels.** Group-address and
+  device names from an imported project went unescaped into HTML; a crafted `.knxproj` could
+  run script there. They are escaped now.
+- **Startup failed on an empty database file** ("attempt to write a readonly database").
+- The archive filter no longer queries everything when a typed date cannot be read.
+- **Space no longer pauses the monitor** while the focus sits in a menu or dialog.
+- `System.Security.Cryptography.Xml` lifted to 10.0.12 (the version Falcon pulls in has known
+  advisories).
+
+**Note for anyone who ran the #32 pull request before it was merged:** the migration was
+recreated as `20261010104540_AddChartSelections`. Drop the `ChartSelections` table and the
+`20260921204924_AddChartSelections` row in `__EFMigrationsHistory` before updating. Regular
+installations are not affected; the database migrates on start as usual.
+
+## [0.12.0]
+
+### Fixed
+- **ETS 4 projects imported without a single datapoint type (#24).** The type was only ever
+  read from the `GroupAddress` element, and ETS 4 never writes it there: across seven ETS 4
+  projects, 95 group addresses, not one carried a type, and migrating the same project to a
+  newer ETS does not add it either. ETS 6 projects can leave it out as well. The result was
+  no value in the monitor and an empty charts page ("no numeric group addresses to plot").
+  The type is now resolved through the communication object linked to the address and,
+  behind it, the manufacturer's application program inside the project archive. It stays
+  deliberately conservative: an object width that fits a dozen types yields nothing, and
+  linked objects declaring contradicting types leave the address empty, because a wrong type
+  decodes every telegram on that address wrongly. Of those 95 addresses, 45 are linked to a
+  communication object at all and 35 of them now resolve; an address with no object attached
+  still has no type, since there is nothing to infer from.
+- **Communication flags were wrong in every project.** ETS 5 and 6 showed none at all (0 of
+  1528 on a real installation): ETS writes a flag into the project file only where the
+  integrator changed it, the rest lives in the manufacturer data, which was never read.
+  ETS 4 showed a single "Transmit" on everything, because the `Send` / `Receive` connectors
+  were reported as flags although they name the object's group-address links, not what it may
+  do - a receive-only actuator input read as transmitting. Both levels are now read, with the
+  integrator's change laid over the factory setting per flag.
+
+### Changed
+- **A project archive is no longer unpacked in full.** Every entry used to be decompressed
+  into memory up front, although an import reads a handful of files: a 6.7 MB project became
+  128 MB of heap, a 33 MB one roughly 550 MB, with single application programs of 50 MB and
+  more - a real OOM risk on a Pi or a memory-capped container. Entries are decompressed on
+  access now, and the application programs the type resolution needs are streamed rather than
+  held.
+- **Flag badges are quieter.** With the flags actually resolved a row commonly carries five of
+  them, and five filled chips next to the DPT badge drowned out the name. They are plain
+  letters now, and the tooltip names the flag instead of repeating every value of every linked
+  communication object.
+
+**Re-import required:** existing projects keep their stored types and flags until the project
+is imported again. The re-import matches on the ETS project id, so it updates in place and the
+recorded telegrams are kept.
+
 ## [0.11.0]
 
 ### Added

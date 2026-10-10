@@ -4,6 +4,11 @@
       <div class="ga-picker">
         <mat-form-field appearance="outline" class="ga-select" subscriptSizing="dynamic">
           <mat-select
+            #gaSelect
+            knxSlashFocus
+            (slashFocus)="gaSelect.open()"
+            [matTooltip]="'common.slashHint' | translate"
+            matTooltipShowDelay="600"
             multiple
             [ngModel]="selectedAddresses"
             (ngModelChange)="onSelectionChange($event)"
@@ -11,6 +16,7 @@
             [placeholder]="'charts.pickGroupAddresses' | translate"
             [disabled]="!hasActiveProject || availableGas.length === 0"
             panelClass="ga-panel"
+            [panelWidth]="gaPanelWidth"
           >
             <!-- Without a custom trigger Material concatenates every selected label, which grows
                  the field until the toolbar wraps. Show one name plus a counter instead. -->
@@ -67,12 +73,96 @@
         </mat-form-field>
       </div>
 
+      <!-- Saved selections. Same popover mechanics as the display options: anchored to the
+           toolbar, closed by a full-screen click-catcher. -->
+      <button
+        class="knx-btn knx-btn--outline saved-toggle"
+        [class.is-active]="savedOpen"
+        (click)="toggleSaved()"
+        [disabled]="!hasActiveProject"
+        [matTooltip]="'charts.saved.tooltip' | translate"
+        [attr.aria-label]="'charts.saved.title' | translate"
+        [attr.aria-expanded]="savedOpen"
+      >
+        <mat-icon>{{ savedSelections.length ? 'bookmarks' : 'bookmark_border' }}</mat-icon>
+      </button>
+
+      @if (savedOpen) {
+        <div class="opts-backdrop" (click)="savedOpen = false"></div>
+        <!-- cdkTrapFocus with auto-capture moves focus into the panel and back to the toggle when it
+             closes; Escape closes it (WCAG 2.1.2, 2.4.3). -->
+        <div class="saved-panel" role="dialog" [attr.aria-label]="'charts.saved.title' | translate"
+             cdkTrapFocus [cdkTrapFocusAutoCapture]="true" (keydown.escape)="savedOpen = false">
+          <div class="opts-title">{{ 'charts.saved.title' | translate }}</div>
+
+          <form class="saved-form" (ngSubmit)="saveSelection()">
+            <input
+              class="knx-input"
+              type="text"
+              name="savedName"
+              maxlength="100"
+              [(ngModel)]="savedName"
+              [placeholder]="'charts.saved.namePlaceholder' | translate"
+              [disabled]="selectedAddresses.length === 0"
+            />
+            <button
+              type="submit"
+              class="knx-btn knx-btn--primary"
+              [disabled]="!savedName.trim() || selectedAddresses.length === 0 || savedBusy"
+            >
+              <mat-icon>bookmark_add</mat-icon>{{ 'charts.saved.save' | translate }}
+            </button>
+          </form>
+          @if (selectedAddresses.length === 0) {
+            <div class="saved-hint">{{ 'charts.saved.needSelection' | translate }}</div>
+          }
+
+          @if (savedError) {
+            <div class="saved-hint saved-hint--err">{{ 'charts.saved.failed' | translate }}</div>
+          }
+
+          <ul class="saved-list">
+            @for (sel of savedSelections; track sel.id) {
+              <li>
+                <button type="button" class="saved-item" (click)="applySaved(sel)" [disabled]="isUnusable(sel)"
+                        [attr.title]="sel.addresses.join(', ')">
+                  <span class="saved-name">{{ sel.name }}</span>
+                  <span class="saved-meta">
+                    {{ 'charts.saved.addresses' | translate: { count: sel.addresses.length } }}
+                    @if (missingCount(sel) > 0) {
+                      · <span class="saved-missing">{{ 'charts.saved.missing' | translate: { count: missingCount(sel) } }}</span>
+                    }
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  class="saved-delete"
+                  (click)="deleteSaved(sel, $event)"
+                  [attr.aria-label]="'charts.saved.delete' | translate"
+                  [matTooltip]="'charts.saved.delete' | translate"
+                >
+                  <mat-icon svgIcon="knx:trash"></mat-icon>
+                </button>
+              </li>
+            } @empty {
+              @if (savedLoading) {
+                <li class="saved-empty" role="status">
+                  <mat-icon class="spin">autorenew</mat-icon>{{ 'charts.saved.loading' | translate }}
+                </li>
+              } @else if (savedLoaded && !savedError) {
+                <li class="saved-empty">{{ 'charts.saved.empty' | translate }}</li>
+              }
+            }
+          </ul>
+        </div>
+      }
+
       <!-- Mobile only: the whole range group collapses behind this toggle. No matTooltip —
            a hover tooltip never shows on touch, so the name lives in aria-label instead. -->
       <button
         class="knx-btn knx-btn--outline range-toggle"
         [class.is-active]="rangeOpen"
-        (click)="rangeOpen = !rangeOpen; rangeHint = false"
+        (click)="rangeOpen = !rangeOpen; rangeHint = ''"
         [attr.aria-label]="'range.title' | translate"
         [attr.aria-expanded]="rangeOpen"
         aria-controls="range-panel"
@@ -96,39 +186,41 @@
 
         <span class="tb-divider"></span>
 
-        <label class="range-field">
-          <span>{{ 'range.from' | translate }}</span>
-          <input #fromInput class="knx-input" type="datetime-local"
-                 [class.is-missing]="rangeHint && !customFrom"
-                 [attr.aria-invalid]="rangeHint && !customFrom"
-                 [ngModel]="customFrom" (ngModelChange)="customFrom = $event; rangeHint = false" />
-        </label>
-        <label class="range-field">
-          <span>{{ 'range.to' | translate }}</span>
-          <input #toInput class="knx-input" type="datetime-local"
-                 [class.is-missing]="rangeHint && !customTo"
-                 [attr.aria-invalid]="rangeHint && !customTo"
-                 [ngModel]="customTo" (ngModelChange)="customTo = $event; rangeHint = false" />
-        </label>
+        <!-- A group rather than a <label>: the field holds two inputs and a calendar button. -->
+        <div class="range-field" role="group" [attr.aria-label]="'range.from' | translate">
+          <span aria-hidden="true">{{ 'range.from' | translate }}</span>
+          <knx-date-time-field #fromInput [label]="'range.from' | translate"
+                 [invalid]="rangeHint === 'missing' && !customFrom"
+                 [ngModel]="customFrom" (ngModelChange)="customFrom = $event; rangeHint = ''" />
+        </div>
+        <div class="range-field" role="group" [attr.aria-label]="'range.to' | translate">
+          <span aria-hidden="true">{{ 'range.to' | translate }}</span>
+          <knx-date-time-field #toInput [label]="'range.to' | translate" defaultTime="23:59"
+                 [invalid]="rangeHint === 'missing' && !customTo"
+                 [min]="customFrom"
+                 [ngModel]="customTo" (ngModelChange)="customTo = $event; rangeHint = ''" />
+        </div>
         <button class="knx-btn knx-btn--outline" (click)="applyCustom()">
           {{ 'range.apply' | translate }}
         </button>
 
         <!-- Always rendered, only the text is switched: a live region that is inserted together
              with its content is not announced. Visually hidden outside the mobile layout. -->
-        <span class="range-hint" role="status" aria-live="polite">{{ rangeHint ? ('range.applyHint' | translate) : '' }}</span>
+        <span class="range-hint" role="status" aria-live="polite">{{ rangeHint === 'missing' ? ('range.applyHint' | translate) : rangeHint === 'order' ? ('range.orderHint' | translate) : '' }}</span>
       </div>
 
       <span class="tb-divider"></span>
 
       <button
         class="knx-btn knx-btn--outline"
-        [class.is-active]="liveAppend"
+        [class.is-active]="liveAppend && preset !== 'custom'"
+        [class.is-inert]="preset === 'custom'"
+        [attr.aria-disabled]="preset === 'custom'"
         (click)="toggleLive()"
         [matTooltip]="liveTooltip()"
         [attr.aria-label]="'charts.live' | translate"
       >
-        <mat-icon>{{ liveAppend ? 'sensors' : 'sensors_off' }}</mat-icon>
+        <mat-icon>{{ liveAppend && preset !== 'custom' ? 'sensors' : 'sensors_off' }}</mat-icon>
         <span class="lbl">{{ 'charts.live' | translate }}</span>
       </button>
 
@@ -204,7 +296,8 @@
         @if (optionsOpen) {
           <!-- Click-catcher so the panel closes on any outside click without a global listener. -->
           <div class="opts-backdrop" (click)="optionsOpen = false"></div>
-          <div class="opts-panel">
+          <div class="opts-panel" role="dialog" [attr.aria-label]="'charts.options' | translate"
+               cdkTrapFocus [cdkTrapFocusAutoCapture]="true" (keydown.escape)="optionsOpen = false">
             <div class="opts-title">{{ 'charts.options' | translate }}</div>
 
             <div class="opts-row opts-row--stack">

@@ -17,6 +17,11 @@ export interface ChartSeries {
   /** Points available before down-sampling — lets the UI state the real ratio. */
   totalPoints: number;
   points: ChartPoint[];
+  /**
+   * Last value before the range start (original timestamp), or null when there is none or the
+   * result is truncated. Lets the curve start at the left edge instead of at the first telegram.
+   */
+  carry: ChartPoint | null;
 }
 
 export interface SeriesResponse {
@@ -34,6 +39,22 @@ export interface StatsResponse {
   total: number;
   bucketMs: number;
   counts: StatsBucket[];
+}
+
+export interface TopEntry {
+  address: string;
+  name: string | null;
+  dpt?: string | null;   // group addresses only
+  count: number;
+  share: number;         // percent of all telegrams in the range, 0..100
+  perHour: number;
+}
+
+export interface TopResponse {
+  total: number;
+  rangeHours: number;
+  groupAddresses: TopEntry[];
+  senders: TopEntry[];
 }
 
 export interface HeatmapResponse {
@@ -69,6 +90,14 @@ export class ChartsService {
     if (from) params = params.set('from', from);
     if (to) params = params.set('to', to);
     return this.http.get<StatsResponse>(`${this.apiUrl}/stats`, { params });
+  }
+
+  /** Busiest group addresses and senders over the range (GET /api/telegrams/top). */
+  getTop(from?: string, to?: string, limit = 20): Observable<TopResponse> {
+    let params = new HttpParams().set('limit', String(limit));
+    if (from) params = params.set('from', from);
+    if (to) params = params.set('to', to);
+    return this.http.get<TopResponse>(`${this.apiUrl}/top`, { params });
   }
 
   /** Activity heatmap (weekday × hour). `tz` = local offset in minutes (getTimezoneOffset()). */

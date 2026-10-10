@@ -5,12 +5,15 @@ import { FormsModule } from '@angular/forms';
 import { Router } from '@angular/router';
 import { HttpClient } from '@angular/common/http';
 import { MatIconModule } from '@angular/material/icon';
+import { MatTooltipModule } from '@angular/material/tooltip';
 import { MatSnackBar } from '@angular/material/snack-bar';
 import { MatDialog } from '@angular/material/dialog';
 import { ProjectService, GroupAddressDto, GroupRangeDto } from '../../core/services/project.service';
 import { LanguageService } from '../../core/i18n/language.service';
 import { TranslatePipe } from '../../core/i18n/translate.pipe';
 import { DptTitleDirective } from '../../shared/grid/dpt-title.directive';
+import { SearchCache, searchTokens } from '../../shared/search.util';
+import { SlashFocusDirective } from '../../shared/slash-focus.directive';
 import { formatKnxDate } from '../../core/i18n/date.util';
 import { LoggerService } from '../../core/logging/logger.service';
 import { ConfirmDialogComponent, ConfirmDialogData } from '../../shared/confirm-dialog.component';
@@ -45,7 +48,12 @@ interface GaLeaf extends GroupAddressDto {
 
   /** Canonical KNX flags aggregated over the linked communication objects. */
   flags?: string[];
-  /** Untouched flag strings from the project, shown in the badge tooltip. */
+  /**
+   * Set only where the badges rest on an INTERPRETATION instead of a real flag: a project that
+   * ships no manufacturer data for an object leaves nothing but the ETS 4 Send/Receive connectors,
+   * and those get mapped onto Transmit/Write. Then the raw value goes into the tooltip so the guess
+   * stays checkable. Stays empty for real flags.
+   */
   flagsRaw?: string;
 }
 
@@ -54,9 +62,10 @@ const READ_ANSWER_TIMEOUT_MS = 3000;
 
 /**
  * Maps what the parser writes into CommunicationObject.Flags onto the canonical KNX flags.
- * ETS 5/6 store them explicitly; ETS 4 only has Send/Receive connectors, which describe the
- * device's role — sending on a group address is transmitting, receiving is being written to.
- * That mapping is an interpretation, so the raw project value stays in the tooltip.
+ * The first six are real flags, read from the manufacturer catalog with the integrator's ETS
+ * changes laid over them. Send/Receive only turn up when a project carries no manufacturer data at
+ * all; they describe the object's group-address links rather than what it may do, so mapping them
+ * onto Transmit/Write is a guess and the tooltip says so.
  */
 const FLAG_ALIASES: Record<string, string> = {
   Communication: 'C',
@@ -71,6 +80,9 @@ const FLAG_ALIASES: Record<string, string> = {
 
 /** Display order of the badges, following the usual KNX notation. */
 const FLAG_ORDER = ['C', 'R', 'W', 'T', 'U', 'I'];
+
+/** Tokens that are a reading of the project's links, not a flag the device declares. */
+const INTERPRETED_FLAGS = ['Send', 'Receive'];
 
 /** Middle group (level 2): groups GAs sharing the same main/middle pair. */
 interface MiddleNode {
@@ -101,7 +113,7 @@ interface MainNode {
 @Component({
   selector: 'app-group-addresses',
   standalone: true,
-  imports: [CommonModule, FormsModule, MatIconModule, TranslatePipe, DptTitleDirective],
+  imports: [CommonModule, FormsModule, MatIconModule, MatTooltipModule, TranslatePipe, DptTitleDirective, SlashFocusDirective],
   templateUrl: './group-addresses.component.html',
   styleUrl: './group-addresses.component.scss'
 })
@@ -131,8 +143,10 @@ export class GroupAddressesComponent implements OnInit, OnDestroy {
   /** Drives the open/closed state of every <details> via a single bound flag. */
   allOpen = true;
 
-  /** Free-text filter over address + name. */
+  /** Free-text filter over address + name, word by word (see shared/search.util). */
   filter = '';
+  /** Folded address + name per leaf, built once per load instead of on every keystroke. */
+  private searchCache = new SearchCache<GaLeaf>(l => `${l.address} ${l.name ?? ''}`);
 
   private telegramSub?: Subscription;
   private flushTimer?: ReturnType<typeof setTimeout>;
@@ -261,7 +275,11 @@ export class GroupAddressesComponent implements OnInit, OnDestroy {
           entry = { tokens: new Set(), raw: new Set() };
           byAddress.set(co.groupAddressLink, entry);
         }
-        entry.raw.add(co.flags);
+        // Only an interpreted value is worth repeating in the tooltip. Collecting the real flags
+        // here put every flag of every linked com object behind every single badge.
+        if (INTERPRETED_FLAGS.some(t => co.flags!.split(',').some(x => x.trim() === t))) {
+          entry.raw.add(co.flags);
+        }
         for (const token of co.flags.split(',')) {
           const normalised = FLAG_ALIASES[token.trim()];
           if (normalised) entry.tokens.add(normalised);
@@ -273,7 +291,7 @@ export class GroupAddressesComponent implements OnInit, OnDestroy {
         if (!entry) continue;
         // Fixed order so the badges read the same on every row.
         leaf.flags = FLAG_ORDER.filter(f => entry.tokens.has(f));
-        leaf.flagsRaw = [...entry.raw].join(' / ');
+        leaf.flagsRaw = entry.raw.size > 0 ? [...entry.raw].join(' / ') : undefined;
       }
     } catch (err) {
       this.logger.error('Failed to load communication object flags:', err);
@@ -286,9 +304,9 @@ export class GroupAddressesComponent implements OnInit, OnDestroy {
   }
 
   /**
-   * Tooltip: the flag's full name plus the raw value from the project, so the interpretation
-   * stays checkable — ETS 4 stores Send/Receive connectors rather than explicit flags, and those
-   * are mapped onto Transmit/Write here.
+   * Tooltip: the flag's full name. The raw project value is appended only where the badge rests on
+   * an interpretation of Send/Receive connectors (see GaLeaf.flagsRaw) — for real flags it just
+   * repeated the whole flag set of every linked com object behind every badge.
    */
   flagTitle(flag: string, leaf: GaLeaf): string {
     const name = this.lang.translate(`ga.flag.${flag}.name`);
@@ -313,11 +331,9 @@ export class GroupAddressesComponent implements OnInit, OnDestroy {
 
   /** Apply the text filter, then rebuild the main/middle/sub tree. */
   private rebuild(): void {
-    const q = this.filter.trim().toLowerCase();
-    const leaves = q
-      ? this.allLeaves.filter(l =>
-          l.address.toLowerCase().includes(q) ||
-          (l.name ?? '').toLowerCase().includes(q))
+    const tokens = searchTokens(this.filter);
+    const leaves = tokens.length
+      ? this.allLeaves.filter(l => this.searchCache.matches(l, tokens))
       : this.allLeaves;
 
     const mainMap = new Map<number, Map<number, GaLeaf[]>>();

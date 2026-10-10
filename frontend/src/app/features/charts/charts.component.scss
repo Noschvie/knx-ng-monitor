@@ -196,17 +196,12 @@
   color: var(--err);
 }
 
-.knx-input.is-missing {
-  border-color: var(--err);
-  box-shadow: 0 0 0 3px var(--err-tint);
-}
-
 // Filter controls all share the same height + vertical centre so the row reads
 // as one aligned strip even when it wraps.
 .tb-right {
   .knx-seg,
   .knx-btn,
-  .range-field .knx-input { height: 36px; }
+  .range-field knx-date-time-field { --dtf-height: 36px; }
 }
 
 .range-field {
@@ -219,16 +214,20 @@
 
   > span { flex: none; }
 
-  .knx-input {
-    height: 36px;
-    width: auto;
-  }
+  // Fits dd.mm.yyyy, hh:mm and the calendar button in the mono font.
+  knx-date-time-field { width: 200px; }
 }
 
 .knx-btn.is-active {
   border-color: var(--brand);
   color: var(--brand);
   background: var(--brand-tint);
+}
+
+// Live toggle with a custom range: stays focusable so its tooltip can say why it does nothing.
+.knx-btn.is-inert {
+  opacity: .55;
+  cursor: default;
 }
 
 .note {
@@ -484,10 +483,11 @@
     min-width: 0;
   }
 
-  // Fixed column for the address so the names line up underneath each other.
+  // Fixed column for the address so the names line up underneath each other. 8ch fits the
+  // longest three-level address (31/7/255).
   .ga-addr {
     flex: none;
-    width: 7ch;
+    width: 8ch;
     font-family: var(--font-mono);
     font-size: var(--fs-xs);
     color: var(--ink-3);
@@ -495,12 +495,15 @@
     font-feature-settings: 'tnum' 1;
   }
 
+  // Wraps instead of ellipsising: GA names are often long dotted paths
+  // (Außen.Gartenhaus.Niederschlag…) whose distinguishing part sits at the end.
   .ga-name {
     flex: 1;
     min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    line-height: 1.35;
+    padding: 5px 0;
     color: var(--ink);
   }
 
@@ -588,6 +591,136 @@
   }
 }
 
+// Saved selections: square icon button beside the GA picker, popover anchored to the
+// toolbar's left padding (the trigger sits on the left, so a right-anchored panel would be
+// far away from it). Reuses .opts-backdrop and the .opts-title look.
+.saved-toggle {
+  flex: none;
+  width: 36px;
+  padding: 0;
+  justify-content: center;
+}
+
+.saved-panel {
+  position: absolute;
+  top: calc(100% + var(--sp-2));
+  left: var(--sp-5);
+  z-index: 41;
+  width: min(380px, calc(100vw - 2 * var(--sp-4)));
+  max-height: min(70vh, 560px);
+  padding: var(--sp-4);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  box-shadow: var(--sh-2, 0 8px 24px rgba(0, 0, 0, .16));
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-2);
+
+  .opts-title {
+    font-size: var(--fs-2xs);
+    text-transform: uppercase;
+    letter-spacing: .05em;
+    color: var(--ink-3);
+    margin-bottom: var(--sp-1);
+  }
+
+  .saved-form {
+    display: flex;
+    gap: var(--sp-2);
+
+    .knx-input { flex: 1; min-width: 0; height: 36px; }
+    .knx-btn { flex: none; }
+  }
+
+  .saved-hint {
+    font-size: var(--fs-xs);
+    color: var(--ink-3);
+
+    &--err { color: var(--err); }
+  }
+
+  // Only the list scrolls; the name field stays in view.
+  .saved-list {
+    list-style: none;
+    margin: var(--sp-2) 0 0;
+    padding: var(--sp-2) 0 0;
+    border-top: 1px solid var(--line);
+    overflow-y: auto;
+    min-height: 0;
+
+    li {
+      display: flex;
+      align-items: center;
+      gap: var(--sp-1);
+
+      + li { border-top: 1px solid var(--line); }
+    }
+  }
+
+  .saved-item {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+    padding: var(--sp-2);
+    border: none;
+    border-radius: var(--r-xs);
+    background: transparent;
+    color: var(--ink);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+
+    &:hover:not(:disabled), &:focus-visible { background: var(--surface-3); }
+    // Nothing of it exists in the active project; the meta line says so.
+    &:disabled { cursor: default; .saved-name { color: var(--ink-3); } }
+  }
+
+  // Wraps like the GA names in the picker; a long name is exactly what people save.
+  .saved-name {
+    font-size: var(--fs-sm);
+    font-weight: var(--fw-medium);
+    overflow-wrap: anywhere;
+  }
+
+  .saved-meta {
+    font-size: var(--fs-xs);
+    color: var(--ink-3);
+  }
+
+  .saved-missing { color: var(--warn, var(--err)); }
+
+  .saved-delete {
+    flex: none;
+    display: inline-grid;
+    place-items: center;
+    width: 32px;
+    height: 32px;
+    border: none;
+    border-radius: var(--r-xs);
+    background: transparent;
+    color: var(--ink-3);
+    cursor: pointer;
+
+    &:hover { background: var(--surface-3); color: var(--err); }
+    mat-icon { width: 18px; height: 18px; font-size: 18px; }
+  }
+
+  .saved-empty {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    padding: var(--sp-3) var(--sp-2);
+
+    .spin { width: 18px; height: 18px; font-size: 18px; animation: charts-spin 1s linear infinite; }
+    font-size: var(--fs-sm);
+    color: var(--ink-3);
+  }
+}
+
 // Mobile: the toolbar collapses to two rows — GA picker + range toggle, then a strip of
 // icon-only actions. The range controls only appear when the toggle is on. Stacking them all
 // vertically (the previous approach) produced nine full-width rows before the chart started.
@@ -611,6 +744,9 @@
   // 44px all the way up to 1560, not only in the phone/tablet band: iPad landscape widths run
   // from 1024 (iPad) over 1180 (Air) to 1366 (Pro 12.9"), all inside this band. The price is
   // that the toggle stands 8px taller than the 36px GA picker next to it on a mouse laptop.
+  // Same 44px touch square as the range toggle it now stands next to.
+  .saved-toggle { width: 44px; height: 44px; }
+
   .range-toggle {
     display: inline-flex;
     flex: 0 0 auto;
@@ -627,7 +763,7 @@
 
     // `order: 2` puts the opened block below the button row instead of above it. The cap keeps
     // the panel from stretching across a 1440px toolbar — at 560px each date column is ~276px,
-    // comfortably above the ~165px the datetime field needs, and it stays under the widths the
+    // comfortably above the ~190px the date-time field needs, and it stays under the widths the
     // narrower bands hand out anyway, so nothing below tablet changes.
     &.is-open {
       display: grid;
@@ -658,8 +794,8 @@
       white-space: normal;
     }
 
-    // Label above the input so From and To end up the same width. `min-width: 0` is required —
-    // datetime-local has an intrinsic minimum around 200px that would otherwise burst the grid.
+    // Label above the input so From and To end up the same width. `min-width: 0` keeps the
+    // field's 200px desktop width from bursting the grid.
     .range-field {
       flex-direction: column;
       align-items: stretch;
@@ -673,11 +809,10 @@
         color: var(--ink-3);
       }
 
-      .knx-input {
+      knx-date-time-field {
         width: 100%;
         min-width: 0;
-        height: 44px;
-        font-size: var(--fs-sm);
+        --dtf-height: 44px;
       }
     }
   }
@@ -793,7 +928,9 @@
   // The backdrop has to clear the nav too, or a tap there would navigate instead of closing.
   .opts-backdrop { z-index: 1001; }
 
-  .opts-panel {
+  // Saved selections open the same way: a popover at the top would cover the toolbar.
+  .opts-panel,
+  .saved-panel {
     position: fixed;
     inset: auto 0 0 0;
     width: auto;
@@ -801,5 +938,34 @@
     box-shadow: var(--sh-3);
     padding-bottom: calc(var(--sp-6) + env(safe-area-inset-bottom, 0px));
     z-index: 1002;
+  }
+
+  .saved-panel { max-height: 80vh; }
+}
+
+// Narrow phones: two columns would leave each date-time field under the ~190px it needs for
+// date, time and the calendar button, so From and To stack instead.
+@media (max-width: 479.98px) {
+  .tb-range.is-open { grid-template-columns: 1fr; }
+}
+
+// On desktop the message used to stay visually hidden, so a refused "Apply" said nothing.
+// Shown as a small callout under the date fields while it has text.
+// Anchored like .opts-panel, to the toolbar: making .tb-right the positioning box would have
+// moved the options popover along with it.
+@media (min-width: 768px) {
+  .range-hint:not(:empty) {
+    top: calc(100% + var(--sp-2));
+    right: var(--sp-5);
+    z-index: 20;
+    width: auto;
+    height: auto;
+    overflow: visible;
+    clip-path: none;
+    padding: 6px 10px;
+    border: 1px solid var(--err);
+    border-radius: var(--r-sm);
+    background: var(--surface);
+    font-size: var(--fs-xs);
   }
 }

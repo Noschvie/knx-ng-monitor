@@ -6,7 +6,7 @@ end-user/install side see the [README](README.md); for version history see the
 
 ## Tech stack
 
-- **Backend** — .NET 9 (ASP.NET Core Web API), EF Core 9 + SQLite, SignalR,
+- **Backend** — .NET 10 (ASP.NET Core Web API), EF Core 10 + SQLite, SignalR,
   [Knx.Falcon.Sdk](https://www.nuget.org/packages/Knx.Falcon.Sdk) for the bus,
   JWT auth (access + refresh tokens), Serilog logging, SharpZipLib for
   AES-encrypted ZIP entries (ETS6 password + KNX Secure).
@@ -19,7 +19,7 @@ end-user/install side see the [README](README.md); for version history see the
 
 ## Prerequisites
 
-- .NET 9 SDK
+- .NET 10 SDK
 - Node.js 20+ and npm
 - Docker (optional, for container builds)
 
@@ -32,7 +32,8 @@ knx-ng-monitor/
 │   ├── KnxMonitor.Core/                # Domain layer (entities, interfaces, DTOs, enums) — no deps
 │   ├── KnxMonitor.Infrastructure/      # EF Core, repositories, KNX bus, project-import adapter
 │   ├── KnxMonitor.ProjectParser/       # Standalone .knxproj parser library (ETS 4/5/6 + Keyring)
-│   ├── KnxMonitor.ProjectParser.Tests/ # 206 xUnit tests (~99 % line coverage)
+│   ├── KnxMonitor.ProjectParser.Tests/ # ~400 xUnit tests for the parser library
+│   ├── KnxMonitor.Infrastructure.Tests/ # xUnit tests for services, repositories, KNX connection
 │   └── KnxMonitor.ParserTool/          # CLI: parse / detect a .knxproj from the shell
 ├── frontend/                           # Angular application
 │   └── src/app/
@@ -46,8 +47,7 @@ knx-ng-monitor/
 │   └── ai/                             # PROJECT_PLAN, RELEASE_PLAN, DOKUMENTATION, TODO
 ├── scripts/                            # build.sh / run-release.sh (+ .ps1 / .bat)
 ├── test-all-samples.sh / .ps1          # Smoke-test the CLI against every sample
-├── Dockerfile                          # Multi-stage build
-└── docker-compose.yml                  # Optional: dev / prod stack
+└── Dockerfile                          # Multi-stage build
 ```
 
 ## Architecture
@@ -67,10 +67,12 @@ knx-ng-monitor/
 
 Key parser internals:
 
-- **`ZipHandler.LoadAsync`** returns a `ProjectFileMap` (an in-memory
-  `Dictionary<string, byte[]>` over the inner files). For password-protected
-  archives it copies the inner `P-XXXX.zip` into a `MemoryStream` and reads it
-  with `SharpZipFile` (AES-capable). For ETS6 the user password is first run
+- **`ZipHandler.LoadAsync`** returns a lazy `ProjectFileMap`: entries are
+  indexed up front and decompressed only when read, the large manufacturer
+  application programs are streamed. For password-protected archives it copies
+  the encrypted inner `P-XXXX.zip` into a `MemoryStream` and reads it with
+  `SharpZipFile` (AES-capable). Parsed XML documents are cached in the map, so
+  `0.xml` is parsed once per import. For ETS6 the user password is first run
   through `PBKDF2-HMAC-SHA256(UTF-16-LE, salt="21.project.ets.knx.org", 65536,
   32)` → Base64 before being handed to SharpZipLib.
 - **Loaders (`Ets4/5/6ProjectLoader`)** consume the `ProjectFileMap`. ETS6 also
@@ -84,7 +86,8 @@ Key parser internals:
   AES-128-CBC. IV is `SHA-256(Created)[:16]`.
 - **`ParserOptions`** carries `Password`, `KeyringStream`, `KeyringPassword`.
   The library returns a `ParseResult` with `Features`, `GroupAddresses`,
-  `Devices`, `Statistics` and (optionally) `Keyring`.
+  `GroupRanges`, `Devices`, `Locations`, `CommunicationObjects`, `Statistics`
+  and (optionally) `Keyring`.
 
 ### Frontend
 
@@ -95,8 +98,8 @@ HTTP interceptor, and lazy loading per feature.
 ### Performance notes
 
 - Virtual scrolling everywhere we expect > 1000 rows.
-- `GroupAddressCacheService` (singleton) holds a `ConcurrentDictionary` of the
-  active project's GAs, refreshed only on project change.
+- `ProjectCacheService` (singleton) holds a `ConcurrentDictionary` of the
+  active project's GAs and devices, refreshed only on project change.
 - DB indices on `Timestamp` and `DestinationAddress`.
 - Telegram persistence runs through a bounded `Channel<KnxTelegram>` drained by a
   `BackgroundService` with batched inserts, decoupling bus throughput from DB
@@ -147,7 +150,7 @@ bash scripts/run-release.sh    # runs ./publish/KnxMonitor.Api on http://localho
 ## Tests
 
 ```bash
-# Parser library tests — the bulk of the suite (206 tests, ~99 % line coverage)
+# Parser library tests, the bulk of the suite
 dotnet test backend/KnxMonitor.ProjectParser.Tests/KnxMonitor.ProjectParser.Tests.csproj
 
 # Coverage (cobertura → coverage-tmp/, gitignored)
@@ -214,24 +217,35 @@ also applied automatically on application startup.
 | `GroupAddresses` | Per-project (Address `m/m/s`, Name, Description, DPT, DataSecure flag) |
 | `Devices` | Per-project (PhysicalAddress `a.l.d`, Name, Manufacturer, ProductName) |
 | `KnxTelegrams` | Logged bus traffic (timestamp, source, dest, type, raw + decoded value) |
+| `Locations` / `CommunicationObjects` / `GroupRanges` | Per-project building structure, com objects with their GA links, GA range tree |
+| `ProjectKeyringKeys` / `ProjectKeyringBlobs` | Keyring material for KNX Secure runtime decryption |
 | `KnxConfigurations` | KNX interface settings |
 | `RecordingSettings` | Ring-buffer size, archive on/off, retention |
+| `MonitorHeartbeats` | One beat per minute (link state, telegram count), feeds the availability view |
 
 ## API endpoints (overview)
 
-- `POST /api/auth/login` · `POST /api/auth/refresh` · `POST /api/auth/logout`
-- `GET /api/projects` · `POST /api/projects/import` (multipart) ·
-  `POST /api/projects/import/{jobId}/provide-input` ·
-  `GET /api/projects/import-status/{jobId}` ·
-  `PUT /api/projects/{id}/activate` · `DELETE /api/projects/{id}`
-- `GET /api/groupaddresses` · `GET /api/groupaddresses/search?query=...`
-- `GET /api/telegrams` · `POST /api/telegrams/search` ·
-  `GET /api/telegrams/export?format=csv` · `GET /api/telegrams/count`
-- `GET/PUT /api/knx/config` · `POST /api/knx/test-connection` ·
-  `GET /api/knx/status`
+- `POST /api/auth/login` · `POST /api/auth/refresh` · `POST /api/auth/logout` ·
+  `POST /api/auth/logout-all` · `GET /api/auth/needs-setup` · `POST /api/auth/setup`
+- `GET /api/projects` · `POST /api/projects/upload` (multipart) ·
+  `GET /api/projects/imports/{id}` · `POST /api/projects/imports/{id}/provide-input` ·
+  `DELETE /api/projects/imports/{id}` · `GET /api/projects/{id}` ·
+  `PUT /api/projects/{id}/activate` · `PUT /api/projects/{id}/deactivate` ·
+  `GET /api/projects/{id}/delete-preview` · `DELETE /api/projects/{id}`
+- `GET /api/projects/{id}/locations` · `/commobjects` · `/groupranges` · `/device` ·
+  `POST /api/projects/{id}/keyring` (group addresses come with the project, there
+  is no separate controller)
+- `GET /api/telegrams` · `GET /api/telegrams/count` · `DELETE /api/telegrams` ·
+  `GET /api/telegrams/export` · `GET /api/telegrams/archive/days` ·
+  `GET /api/telegrams/archive/{date}` · `GET /api/telegrams/series` ·
+  `GET /api/telegrams/stats` · `GET /api/telegrams/heatmap`
+- `GET /api/knx/status` · `POST /api/knx/connect` · `POST /api/knx/disconnect` ·
+  `POST /api/knx/test-connection` · `GET/PUT /api/knx/autoconnect` ·
+  `POST /api/knx/write` · `POST /api/knx/read` · `GET/POST /api/knx/configurations` ·
+  `GET/PUT /api/knx/configurations/{id}`
 - `GET /api/recording/settings` · `PUT /api/recording/settings`
-- `GET /api/diagnostics/logs` · `GET /api/diagnostics/download` ·
-  `GET /api/version`
+- `GET /api/diagnostics/logs` · `GET /api/diagnostics/availability` ·
+  `GET /api/diagnostics/download` · `GET /api/version`
 - `GET /healthz` — anonymous liveness probe
 - `/hubs/telegram` — SignalR hub for live telegrams (JWT-authenticated)
 - `/hubs/logs` — SignalR hub for the live in-app log viewer
@@ -257,7 +271,7 @@ OpenAPI (Scalar) is exposed in `Development` at
 ## Docker multi-stage build
 
 1. **Node 20** — `ng build --configuration production`.
-2. **.NET 9 SDK** — `dotnet publish -c Release -r <RID> --self-contained true
+2. **.NET 10 SDK** — `dotnet publish -c Release -r <RID> --self-contained true
    -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true`.
 3. **debian:12-slim** runtime — copies the single-file binary, installs
    `libicu72`, runs as non-root `app` (uid 1000), `ENTRYPOINT

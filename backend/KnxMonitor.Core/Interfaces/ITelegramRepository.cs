@@ -57,12 +57,55 @@ public interface ITelegramRepository : IRepository<KnxTelegram>
         IReadOnlyCollection<string> addresses, DateTime from, DateTime to, int maxRows,
         CancellationToken ct = default);
 
+    /// <summary>
+    /// For each address, up to <paramref name="perAddress"/> telegrams strictly before
+    /// <paramref name="before"/>, newest first. Lets the chart carry the last known value into the
+    /// start of a range; several rows because the newest one may carry no value (a read request).
+    /// Addresses without any earlier telegram are absent from the result.
+    /// </summary>
+    Task<IReadOnlyDictionary<string, IReadOnlyList<KnxTelegram>>> GetLatestBeforeAsync(
+        IReadOnlyCollection<string> addresses, DateTime before, int perAddress,
+        CancellationToken ct = default);
+
     /// <summary>Counts telegrams in [from,to] (no other filter). Backs the statistics view.</summary>
     Task<int> CountInRangeAsync(DateTime from, DateTime to, CancellationToken ct = default);
 
     /// <summary>
     /// Streams (Timestamp only) for telegrams in [from,to] ordered ASC, for in-memory bucketing.
+    /// The statistics endpoints aggregate in SQL instead (see <see cref="CountPerBucketAsync"/>);
+    /// this stays as the reference the SQL aggregation is tested against.
     /// </summary>
     IAsyncEnumerable<DateTime> StreamTimestampsInRangeAsync(
         DateTime from, DateTime to, CancellationToken ct = default);
+
+    /// <summary>
+    /// Telegram counts in [from,to] split into <paramref name="bucketCount"/> buckets of
+    /// <paramref name="bucketMs"/> milliseconds starting at <paramref name="from"/>, counted in
+    /// SQL. A telegram lands in bucket <c>(int)((ts - from).TotalMilliseconds / bucketMs)</c>,
+    /// clamped to the valid range, exactly like counting the streamed timestamps would.
+    /// </summary>
+    Task<long[]> CountPerBucketAsync(
+        DateTime from, DateTime to, int bucketCount, double bucketMs, CancellationToken ct = default);
+
+    /// <summary>Oldest and newest stored timestamp, or null when no telegram is stored.</summary>
+    Task<(DateTime Oldest, DateTime Newest)?> GetTimestampBoundsAsync(CancellationToken ct = default);
+
+    /// <summary>
+    /// Telegram counts in [from,to] per weekday (0 = Sunday) and hour, counted in SQL after
+    /// shifting each UTC timestamp by <paramref name="tzOffsetMinutes"/> (minutes the display zone
+    /// is behind UTC, as JavaScript's getTimezoneOffset reports it). Returns a 7 x 24 grid.
+    /// </summary>
+    Task<long[][]> CountPerWeekdayHourAsync(
+        DateTime from, DateTime to, int tzOffsetMinutes, CancellationToken ct = default);
+
+    /// <summary>
+    /// Destination group addresses with the most telegrams in [from,to], busiest first (ties by
+    /// address). Grouped in SQL over the (Timestamp, DestinationAddress) index.
+    /// </summary>
+    Task<IReadOnlyList<AddressCount>> GetTopDestinationsAsync(
+        DateTime from, DateTime to, int limit, CancellationToken ct = default);
+
+    /// <summary>Source devices (individual addresses) with the most telegrams in [from,to], busiest first (ties by address).</summary>
+    Task<IReadOnlyList<AddressCount>> GetTopSourcesAsync(
+        DateTime from, DateTime to, int limit, CancellationToken ct = default);
 }
