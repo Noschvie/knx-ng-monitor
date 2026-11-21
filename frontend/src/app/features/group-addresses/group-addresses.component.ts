@@ -10,8 +10,12 @@ import { MatSnackBar } from '@angular/material/snack-bar';
 import { MatDialog } from '@angular/material/dialog';
 import { ProjectService, GroupAddressDto, GroupRangeDto } from '../../core/services/project.service';
 import { LanguageService } from '../../core/i18n/language.service';
+import { localeTag } from '../../core/i18n/locale.util';
+import { formatDecodedValue } from '../../core/i18n/value-format.util';
 import { TranslatePipe } from '../../core/i18n/translate.pipe';
 import { DptTitleDirective } from '../../shared/grid/dpt-title.directive';
+import { dpt1Labels } from '../../shared/grid/knx-grid.util';
+import { DptSelectComponent, dptGroupsOf, matchesDptFilter } from '../../shared/dpt-select/dpt-select.component';
 import { SearchCache, searchTokens } from '../../shared/search.util';
 import { SlashFocusDirective } from '../../shared/slash-focus.directive';
 import { formatKnxDate } from '../../core/i18n/date.util';
@@ -113,7 +117,7 @@ interface MainNode {
 @Component({
   selector: 'app-group-addresses',
   standalone: true,
-  imports: [CommonModule, FormsModule, MatIconModule, MatTooltipModule, TranslatePipe, DptTitleDirective, SlashFocusDirective],
+  imports: [CommonModule, FormsModule, MatIconModule, MatTooltipModule, TranslatePipe, DptTitleDirective, SlashFocusDirective, DptSelectComponent],
   templateUrl: './group-addresses.component.html',
   styleUrl: './group-addresses.component.scss'
 })
@@ -147,6 +151,11 @@ export class GroupAddressesComponent implements OnInit, OnDestroy {
   filter = '';
   /** Folded address + name per leaf, built once per load instead of on every keystroke. */
   private searchCache = new SearchCache<GaLeaf>(l => `${l.address} ${l.name ?? ''}`);
+
+  /** DPT filter (#45): "" = all, "9" = every DPT 9, "9.007" = exactly that subtype. */
+  dptFilter = '';
+  /** DPT strings of all leaves, the source of the type filter's options. */
+  leafDpts: (string | null | undefined)[] = [];
 
   private telegramSub?: Subscription;
   private flushTimer?: ReturnType<typeof setTimeout>;
@@ -215,6 +224,11 @@ export class GroupAddressesComponent implements OnInit, OnDestroy {
     this.pendingValues.clear();
   }
 
+  /** The live value in the browser locale (#44); stored raw, formatted only for display. */
+  liveValueText(leaf: GaLeaf): string {
+    return formatDecodedValue(leaf.liveValue, leaf.datapointType, localeTag(this.lang.lang()));
+  }
+
   /** Absolute timestamp of the shown value, for the row tooltip. */
   liveValueTitle(leaf: GaLeaf): string | null {
     if (!leaf.liveAt) return null;
@@ -244,6 +258,7 @@ export class GroupAddressesComponent implements OnInit, OnDestroy {
       }
       this.groupRanges = await this.projectService.getGroupRanges(active.id).toPromise() || [];
       await this.loadFlags(active.id);
+      this.resetStaleDptFilter();
       this.rebuild();
     } catch (err) {
       this.logger.error('Failed to load group addresses:', err);
@@ -329,11 +344,19 @@ export class GroupAddressesComponent implements OnInit, OnDestroy {
     };
   }
 
-  /** Apply the text filter, then rebuild the main/middle/sub tree. */
+  private resetStaleDptFilter(): void {
+    // Set once per load: a fresh array on every change detection would rebuild the options.
+    this.leafDpts = this.allLeaves.map(l => l.datapointType);
+    if (!this.dptFilter) return;
+    const groups = dptGroupsOf(this.leafDpts);
+    if (!groups.some(g => g.main === this.dptFilter || g.subs.includes(this.dptFilter))) this.dptFilter = '';
+  }
+
+  /** Apply the text and DPT filters, then rebuild the main/middle/sub tree. */
   private rebuild(): void {
     const tokens = searchTokens(this.filter);
-    const leaves = tokens.length
-      ? this.allLeaves.filter(l => this.searchCache.matches(l, tokens))
+    const leaves = tokens.length || this.dptFilter
+      ? this.allLeaves.filter(l => matchesDptFilter(l.datapointType, this.dptFilter) && this.searchCache.matches(l, tokens))
       : this.allLeaves;
 
     const mainMap = new Map<number, Map<number, GaLeaf[]>>();
@@ -450,6 +473,13 @@ export class GroupAddressesComponent implements OnInit, OnDestroy {
    * Mobile: folds a leaf's value input open or shut. On desktop the input is always visible,
    * where the CSS simply ignores the flag.
    */
+  /** Label of a 1-bit value in the subtype's wording ("Up" / "Down" for 1.008), Off / On otherwise (#46). */
+  boolLabel(leaf: GaLeaf, value: string): string {
+    const labels = dpt1Labels(leaf.datapointType, this.lang.lang());
+    if (labels) return labels[value === '1' ? 1 : 0];
+    return this.lang.translate(value === '1' ? 'detail.on' : 'detail.off');
+  }
+
   toggleWrite(leaf: GaLeaf): void {
     leaf.writeOpen = !leaf.writeOpen;
   }
@@ -457,9 +487,7 @@ export class GroupAddressesComponent implements OnInit, OnDestroy {
   async write(leaf: GaLeaf): Promise<void> {
     if (leaf.writeValue === '') return;
 
-    const shown = leaf.isBool
-      ? this.lang.translate(leaf.writeValue === '1' ? 'detail.on' : 'detail.off')
-      : leaf.writeValue;
+    const shown = leaf.isBool ? this.boolLabel(leaf, leaf.writeValue) : leaf.writeValue;
 
     const data: ConfirmDialogData = {
       title: this.lang.translate('detail.writeConfirmTitle'),

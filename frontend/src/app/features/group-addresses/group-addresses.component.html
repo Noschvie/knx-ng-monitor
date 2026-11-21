@@ -12,6 +12,7 @@
                [matTooltip]="'common.slashHint' | translate" matTooltipShowDelay="600"
                [(ngModel)]="filter" (ngModelChange)="onFilterChange()"
                [placeholder]="'ga.filterPlaceholder' | translate" />
+        <knx-dpt-select class="ga-dpt" [dpts]="leafDpts" [(value)]="dptFilter" (valueChange)="onFilterChange()" />
         <button class="knx-btn knx-btn--outline" (click)="setAllOpen(true)">
           <mat-icon>unfold_more</mat-icon>
           {{ 'ga.expandAll' | translate }}
@@ -108,7 +109,7 @@
                               @if (leaf.pendingRead) {
                                 <span class="leaf-value is-waiting">{{ 'ga.waiting' | translate }}</span>
                               } @else if (leaf.liveValue !== undefined) {
-                                <span class="leaf-value" [attr.title]="liveValueTitle(leaf)">{{ leaf.liveValue }}</span>
+                                <span class="leaf-value" [attr.title]="liveValueTitle(leaf)">{{ liveValueText(leaf) }}</span>
                               } @else if (leaf.noAnswer) {
                                 <span class="leaf-value is-muted">{{ 'ga.noAnswer' | translate }}</span>
                               } @else {
@@ -140,8 +141,8 @@
                               <div class="slot slot-write" [class.is-open]="leaf.writeOpen">
                                 @if (leaf.isBool) {
                                   <select class="knx-input knx-input--sm" [(ngModel)]="leaf.writeValue">
-                                    <option value="1">{{ 'detail.on' | translate }}</option>
-                                    <option value="0">{{ 'detail.off' | translate }}</option>
+                                    <option value="0">{{ boolLabel(leaf, '0') }}</option>
+                                    <option value="1">{{ boolLabel(leaf, '1') }}</option>
                                   </select>
                                 } @else {
                                   <input class="knx-input knx-input--sm" type="text" [(ngModel)]="leaf.writeValue"
