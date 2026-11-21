@@ -8,10 +8,12 @@ import { MatTooltipModule } from '@angular/material/tooltip';
 import { MatSnackBar } from '@angular/material/snack-bar';
 import { MAT_DIALOG_DATA, MatDialog, MatDialogModule, MatDialogRef } from '@angular/material/dialog';
 import { Router } from '@angular/router';
-import { messageTypeKind, messageTypeName, unitForDpt } from './knx-grid.util';
+import { dpt1Labels, messageTypeKind, messageTypeName, unitForDpt } from './knx-grid.util';
 import { DptTitleDirective } from './dpt-title.directive';
 import { TranslatePipe } from '../../core/i18n/translate.pipe';
 import { LanguageService } from '../../core/i18n/language.service';
+import { localeTag } from '../../core/i18n/locale.util';
+import { formatDecodedValue } from '../../core/i18n/value-format.util';
 import { formatKnxDate } from '../../core/i18n/date.util';
 import { ConfirmDialogComponent, ConfirmDialogData } from '../confirm-dialog.component';
 import { ProjectService, CommunicationObjectDto, DeviceDto } from '../../core/services/project.service';
@@ -74,7 +76,7 @@ export interface TelegramDetailData {
 
       <div class="knx-sheet-value">
         <div class="value-hero">
-          <span class="big mono">{{ data.valueDecoded || data.value || '–' }}</span>
+          <span class="big mono">{{ displayValue || data.value || '–' }}</span>
           @if (unit) { <span class="big-unit">{{ unit }}</span> }
         </div>
       </div>
@@ -122,8 +124,8 @@ export interface TelegramDetailData {
           <div class="actions-row write-row">
             @if (isBoolDpt) {
               <select class="knx-input" [(ngModel)]="writeValue">
-                <option value="1">{{ 'detail.on' | translate }}</option>
-                <option value="0">{{ 'detail.off' | translate }}</option>
+                <option value="0">{{ boolLabel('0') }}</option>
+                <option value="1">{{ boolLabel('1') }}</option>
               </select>
             } @else {
               <input class="knx-input" type="text" [(ngModel)]="writeValue"
@@ -242,6 +244,11 @@ export class TelegramDetailComponent implements OnInit, AfterViewInit, OnDestroy
     return messageTypeName(this.data.messageType);
   }
 
+  /** Decoded value in the browser locale (#44). */
+  get displayValue(): string {
+    return formatDecodedValue(this.data.valueDecoded, this.data.datapointType, localeTag(this.lang.lang()));
+  }
+
   get unit(): string {
     const v = (this.data.valueDecoded ?? '').toString().trim();
     return /^-?\d[\d.,\s]*$/.test(v) ? unitForDpt(this.data.datapointType) : '';
@@ -254,6 +261,13 @@ export class TelegramDetailComponent implements OnInit, AfterViewInit, OnDestroy
   }
 
   get isBoolDpt(): boolean { return this.dptMain === 1; }
+
+  /** Label of a 1-bit value in the subtype's wording ("Up" / "Down" for 1.008), Off / On otherwise (#46). */
+  boolLabel(value: string): string {
+    const labels = dpt1Labels(this.data.datapointType, this.lang.lang());
+    if (labels) return labels[value === '1' ? 1 : 0];
+    return this.lang.translate(value === '1' ? 'detail.on' : 'detail.off');
+  }
   get isNumericDpt(): boolean {
     const m = this.dptMain;
     return m !== null && [5, 6, 7, 8, 9, 12, 13, 14].includes(m);
@@ -285,9 +299,7 @@ export class TelegramDetailComponent implements OnInit, AfterViewInit, OnDestroy
     const address = this.data.destinationAddress;
     if (!address || this.writeValue === '') return;
 
-    const shown = this.isBoolDpt
-      ? this.lang.translate(this.writeValue === '1' ? 'detail.on' : 'detail.off')
-      : this.writeValue;
+    const shown = this.isBoolDpt ? this.boolLabel(this.writeValue) : this.writeValue;
 
     const data: ConfirmDialogData = {
       title: this.lang.translate('detail.writeConfirmTitle'),
